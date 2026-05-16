@@ -18,6 +18,26 @@ static void update_pixels() {
     if ((int)pixelBuffer.size() != Nx * Ny * 3)
         pixelBuffer.assign(Nx * Ny * 3, 0);
 
+    auto isSolidLiquidInterface = [&](int x, int y) {
+        if (y < 0 || y >= Ny || x < 0 || x >= Nx) return false;
+        int id = y * Nx + x;
+        if (phi[id] <= 0.5) return false;
+        bool solid = fs[id] > 0.5;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                int nx = x + dx;
+                int ny = y + dy;
+                if (nx < 0 || nx >= Nx || ny < 0 || ny >= Ny) continue;
+                int nid = ny * Nx + nx;
+                if (phi[nid] > 0.5 && (fs[nid] > 0.5) != solid) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
     for (int y = 0; y < Ny; ++y) {
         for (int x = 0; x < Nx; ++x) {
             int id = y * Nx + x;
@@ -25,15 +45,18 @@ static void update_pixels() {
             double fs_val = fs[id];
             uint8_t r, g, b;
 
-            if (y < 2) {
+            if (y < 3) {
                 // 地面
                 r = 20; g = 20; b = 30;
-            } else if (fs_val > 0.5) {
-                // 冰
-                r = 240; g = 240; b = 255;
+            } else if (phi_val > 0.5 && isSolidLiquidInterface(x, y)) {
+                // 固液界面
+                r = 255; g = 60; b = 60;
+            } else if (phi_val > 0.5 && fs_val > 0.5) {
+                // 固相
+                r = 240; g = 240; b = 250;
             } else if (phi_val > 0.5) {
                 // 液相
-                r = 10; g = 190; b = 245;
+                r = 15; g = 170; b = 230;
             } else {
                 // 气相
                 r = 5; g = 20; b = 80;
