@@ -22,14 +22,14 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
 }
 
 void LBMSolver::initialize_fields() {
-    // 在地面 (y=0) 上放置一个基于接触角的圆帽 (spherical cap)
-    // 选择基底半径 baseR（格点单位），由接触角决定曲率半径 R
+    // 在地面上放置一个球帽形液滴，并在其下半部分初始化为固相
     double theta = wettingAngle;
-    double baseR = std::min(Nx, Ny) * 0.28; // 基底半径，控制摊开程度
-    double R = baseR / std::sin(theta);     // 曲率半径
+    double baseR = std::min(Nx, Ny) * 0.28;
+    double R = baseR / std::sin(theta);
     double centerX = Nx * 0.5;
-    // 球心应位于基底平面之下（球在平面之上形成圆帽），因此为负值
-    double centerY = -R * std::cos(theta);
+    double verticalShift = std::max(4.0, Ny * 0.08);
+    double centerY = -R * std::cos(theta) + verticalShift;
+    double solidRadius = R * 0.60;
     double interfaceWidth = 2.0;
 
     for (int y = 0; y < Ny; ++y) {
@@ -38,29 +38,28 @@ void LBMSolver::initialize_fields() {
             double dxl = x - centerX;
             double dyl = y - centerY;
             double r = std::sqrt(dxl * dxl + dyl * dyl);
+            bool insideDrop = (y >= 0 && r <= R + interfaceWidth);
             double phi_val = 0.0;
-            // 仅取球面在 y>=0 的上半帽作为液滴
-            if (y >= 0 && r <= R - interfaceWidth) {
-                // 在曲面内且位于帽体范围内
-                // 横向投影距离（到中心 X 方向）应小于基底半径 baseR
-                double projR = std::abs(dxl);
-                if (projR <= baseR + 1e-6) phi_val = 1.0;
-            } else if (y >= 0 && r <= R + interfaceWidth) {
-                double projR = std::abs(dxl);
-                if (projR <= baseR + 1e-6) {
-                    double t = (r - (R - interfaceWidth)) / (2.0 * interfaceWidth);
-                    phi_val = std::clamp(1.0 - t, 0.0, 1.0);
+            if (insideDrop) {
+                double dist = r - R;
+                if (dist <= -interfaceWidth) {
+                    phi_val = 1.0;
                 } else {
-                    phi_val = 0.0;
+                    phi_val = std::clamp(0.5 * (1.0 - dist / interfaceWidth) + 0.5, 0.0, 1.0);
                 }
-            } else {
-                phi_val = 0.0; // 气相
             }
 
+            bool insideSolid = insideDrop && (r <= solidRadius);
+            double fs_val = insideSolid ? 1.0 : 0.0;
+
             phi[id] = std::clamp(phi_val, 0.0, 1.0);
-            // 初始温度：液滴内高于融点，气相与地面低温
-            if (phi[id] > 0.5) T[id] = 1.0; else T[id] = 0.0;
-            fs[id] = 0.0;
+            fs[id] = fs_val;
+            if (phi[id] > 0.5) {
+                T[id] = insideSolid ? 0.0 : 1.0;
+            } else {
+                T[id] = 0.0;
+            }
+
             ux[id] = 0.0;
             uy[id] = 0.0;
             rho[id] = rho_l;
