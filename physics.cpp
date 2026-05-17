@@ -3,6 +3,15 @@
 #include <cstring>
 #include <cmath>
 
+static const int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
+static const int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+static const double w[9] = {
+    4.0 / 9.0, 
+    1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0
+};
+static const int opp[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6}; // 反向索引，用于反弹边界条件
+
 LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
     : Nx(nx), Ny(ny), gamma(gamma_), Ste(Ste_), Pr(Pr_), dx(1.0), dt(0.1),
       rho_l(1.0), rho_s(gamma_), L(1.0), cp(1.0), current(0), next(1),
@@ -18,11 +27,10 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
     tau_f = 0.8;
     tau_g = 0.7;
     tau_h = 0.9;
-    wettingAngle = 30.0 * M_PI / 180.0; // 默认接触角改为 30°，更易摊开
+    wettingAngle = 30.0 * M_PI / 180.0; // 默认接触角 30°
 }
 
 void LBMSolver::initialize_fields() {
-    // 在地面上放置一个球帽形液滴，并在其下半部分初始化为固相
     double theta = wettingAngle;
     double baseR = std::min(Nx, Ny) * 0.28;
     double R = baseR / std::sin(theta);
@@ -77,30 +85,8 @@ void LBMSolver::initialize_fields() {
     }
 }
 
-void LBMSolver::apply_boundary_conditions() {
-    for (int x = 0; x < Nx; ++x) {
-        int id = index(x, 0);
-        ux[id] = 0.0;
-        uy[id] = 0.0;
-        // 底面为冷壁，T固定为0，促使接触处结冰
-        phi[id] = 0.5 + 0.5 * std::cos(wettingAngle);
-        T[id] = 0.0;
-        fs[id] = std::clamp(fs[id], 0.0, 1.0);
-        for (int k = 0; k < q; ++k) {
-            int xp = x;
-            int yp = 1;
-            int idx = offset(x, 0, k);
-            int idxb = offset(xp, yp, opp[k]);
-            f[current][idx] = f[current][idxb];
-            f[next][idx] = f[next][idxb];
-            g[current][idx] = g[current][idxb];
-            g[next][idx] = g[next][idxb];
-            double heq = w[k] * T[id];
-            h[current][idx] = heq;
-            h[next][idx] = heq;
-        }
-    }
-}
+// 迁移与边界处理已统一合并进各 field 更新中，此函数留空即可
+void LBMSolver::apply_boundary_conditions() {}
 
 void LBMSolver::compute_macros() {
     for (int y = 0; y < Ny; ++y) {
@@ -113,11 +99,11 @@ void LBMSolver::compute_macros() {
             double uy_loc = 0.0;
             for (int k = 0; k < q; ++k) {
                 int idx = offset(x, y, k);
-                rho_loc += f[current][idx];
-                phi_loc += g[current][idx];
+                rho_loc  += f[current][idx];
+                phi_loc  += g[current][idx];
                 enthalpy += h[current][idx];
-                ux_loc += f[current][idx] * cx[k];
-                uy_loc += f[current][idx] * cy[k];
+                ux_loc   += f[current][idx] * cx[k];
+                uy_loc   += f[current][idx] * cy[k];
             }
             rho[id] = rho_loc;
             phi[id] = std::clamp(phi_loc, 0.0, 1.0);
@@ -135,31 +121,39 @@ void LBMSolver::compute_macros() {
 }
 
 void LBMSolver::update_phase_field() {
-    // 可控相场演化：弱化 Allen-Cahn，加入平均源项修正以近似守恒
     const double mobility = 0.002;
     const double epsilon = 0.03;
     std::vector<double> phi_old = phi;
     std::vector<double> rhs(Nx * Ny, 0.0);
 
+    // 修复：x 轴实现完整的周期性循环 [0, Nx-1]
     for (int y = 1; y < Ny - 1; ++y) {
-        for (int x = 1; x < Nx - 1; ++x) {
+        for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
-            double lap = phi_old[index(x+1,y)] + phi_old[index(x-1,y)]
-                       + phi_old[index(x,y+1)] + phi_old[index(x,y-1)]
+            int xm = (x - 1 + Nx) % Nx;
+            int xp = (x + 1) % Nx;
+
+            double lap = phi_old[index(xp, y)] + phi_old[index(xm, y)]
+                       + phi_old[index(x, y+1)] + phi_old[index(x, y-1)]
                        - 4.0 * phi_old[id];
-            double advection = ux[id] * (phi_old[index(x+1,y)] - phi_old[index(x-1,y)]) * 0.5
-                             + uy[id] * (phi_old[index(x,y+1)] - phi_old[index(x,y-1)]) * 0.5;
+            double advection = ux[id] * (phi_old[index(xp, y)] - phi_old[index(xm, y)]) * 0.5
+                             + uy[id] * (phi_old[index(x, y+1)] - phi_old[index(x, y-1)]) * 0.5;
             double chemical = phi_old[id] * phi_old[id] * phi_old[id] - phi_old[id];
             rhs[id] = mobility * (epsilon * lap - chemical) - advection;
         }
     }
 
     double avg_rhs = 0.0; int count = 0;
-    for (int y = 1; y < Ny - 1; ++y) for (int x = 1; x < Nx - 1; ++x) { avg_rhs += rhs[index(x,y)]; ++count; }
-    if (count>0) avg_rhs /= count;
+    for (int y = 1; y < Ny - 1; ++y) {
+        for (int x = 0; x < Nx; ++x) { 
+            avg_rhs += rhs[index(x, y)]; 
+            ++count; 
+        }
+    }
+    if (count > 0) avg_rhs /= count;
 
     for (int y = 1; y < Ny - 1; ++y) {
-        for (int x = 1; x < Nx - 1; ++x) {
+        for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
             double phi_new = phi_old[id] + dt * (rhs[id] - avg_rhs);
             phi[id] = std::clamp(phi_new, 0.0, 1.0);
@@ -170,29 +164,45 @@ void LBMSolver::update_phase_field() {
             }
         }
     }
+
+    // 显式维护 y=0 和 y=Ny-1 边界上的相场分布函数
+    for (int x = 0; x < Nx; ++x) {
+        int id_b = index(x, 0);
+        phi[id_b] = 0.5 + 0.5 * std::cos(wettingAngle); // 底面接触角
+        int id_t = index(x, Ny - 1);
+        phi[id_t] = 0.0; // 顶面纯气相
+        for (int k = 0; k < q; ++k) {
+            g[next][offset(x, 0, k)] = w[k] * phi[id_b];
+            g[next][offset(x, Ny - 1, k)] = w[k] * phi[id_t];
+        }
+    }
 }
 
 void LBMSolver::update_enthalpy() {
-    // 恢复焓法扩散与固相分数计算（受限的，便于观察底层结冰）
     const double Tm = 0.5;
-    const double alpha = 0.02 * Pr; // 热扩散系数
+    const double alpha = 0.02 * Pr; 
     std::vector<double> enthalpy(Nx * Ny);
 
-    for (int y = 0; y < Ny; ++y) for (int x = 0; x < Nx; ++x) {
-        int id = index(x,y);
-        enthalpy[id] = cp * T[id] + L * fs[id];
+    for (int y = 0; y < Ny; ++y) {
+        for (int x = 0; x < Nx; ++x) {
+            int id = index(x, y);
+            enthalpy[id] = cp * T[id] + L * fs[id];
+        }
     }
 
+    // 修复：x 轴实现完整的周期性循环 [0, Nx-1]
     for (int y = 1; y < Ny - 1; ++y) {
-        for (int x = 1; x < Nx - 1; ++x) {
+        for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
-            double lapT = T[index(x+1,y)] + T[index(x-1,y)]
-                        + T[index(x,y+1)] + T[index(x,y-1)]
+            int xm = (x - 1 + Nx) % Nx;
+            int xp = (x + 1) % Nx;
+
+            double lapT = T[index(xp, y)] + T[index(xm, y)]
+                        + T[index(x, y+1)] + T[index(x, y-1)]
                         - 4.0 * T[id];
             double Hnew = enthalpy[id] + alpha * dt * lapT;
 
             double fs_new = std::clamp((Hnew - cp * Tm) / L, 0.0, 1.0);
-            // 底层接触处更易冻结：如果靠近地面且为液相，则加快固化
             if (y <= 3 && phi[id] > 0.5 && T[id] < Tm) fs_new = std::max(fs_new, 0.6);
             fs[id] = fs_new;
             T[id] = std::clamp((Hnew - L * fs_new) / cp, 0.0, 1.0);
@@ -202,33 +212,71 @@ void LBMSolver::update_enthalpy() {
             }
         }
     }
+
+    // 显式维护 y=0 和 y=Ny-1 边界上的温度场分布函数
+    for (int x = 0; x < Nx; ++x) {
+        int id_b = index(x, 0);
+        T[id_b] = 0.0; // 底面冷壁
+        int id_t = index(x, Ny - 1);
+        T[id_t] = 1.0; // 顶面环境温度
+        for (int k = 0; k < q; ++k) {
+            h[next][offset(x, 0, k)] = w[k] * T[id_b];
+            h[next][offset(x, Ny - 1, k)] = w[k] * T[id_t];
+        }
+    }
 }
 
 void LBMSolver::update_flow_field() {
-    compute_macros();
-    apply_boundary_conditions();
-    // 简化 BGK 推进，无外力
+    // 1. 创建临时的碰撞后分布函数缓存 f_post，防止覆盖未迁移的数据
+    std::vector<double> f_post(Nx * Ny * q, 0.0);
+
     for (int y = 1; y < Ny - 1; ++y) {
-        for (int x = 1; x < Nx - 1; ++x) {
+        for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
             double rho_loc = rho[id];
             double ux_loc = ux[id];
             double uy_loc = uy[id];
             double u_sq = ux_loc * ux_loc + uy_loc * uy_loc;
+
             for (int k = 0; k < q; ++k) {
                 double cu = cx[k] * ux_loc + cy[k] * uy_loc;
                 double feq = w[k] * rho_loc * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * u_sq);
                 int idx = offset(x, y, k);
-                double fpost = f[current][idx] - (f[current][idx] - feq) / tau_f;
-                int xp = x + cx[k];
-                int yp = y + cy[k];
-                if (xp < 0) xp += Nx;
-                if (xp >= Nx) xp -= Nx;
-                if (yp < 0) yp += Ny;
-                if (yp >= Ny) yp -= Ny;
-                f[next][offset(xp, yp, k)] = fpost;
+                f_post[idx] = f[current][idx] - (f[current][idx] - feq) / tau_f;
             }
         }
+    }
+
+    // 2. 统一进行 Gather 迁移，并在迁移时自然处理上下壁面的 Half-way 反弹
+    for (int y = 1; y < Ny - 1; ++y) {
+        for (int x = 0; x < Nx; ++x) {
+            for (int k = 0; k < q; ++k) {
+                int sx = (x - cx[k] + Nx) % Nx; // x 方向完美拉取周期性邻居
+                int sy = y - cy[k];
+
+                if (sy == 0) {
+                    // 邻居跨出了底界：对当前格点实施标准固壁半步反弹
+                    f[next][offset(x, y, k)] = f_post[offset(x, y, opp[k])];
+                } else if (sy == Ny - 1) {
+                    // 邻居跨出了顶界：实施顶壁反弹（或可改自由滑移）
+                    f[next][offset(x, y, k)] = f_post[offset(x, y, opp[k])];
+                } else {
+                    // 内部网格正常 Gather 迁移
+                    f[next][offset(x, y, k)] = f_post[offset(sx, sy, k)];
+                }
+            }
+        }
+    }
+
+    // 3. 强行锁定边界上的宏观量，防止 compute_macros 累加未初始化的死区数据导致抖动
+    for (int x = 0; x < Nx; ++x) {
+        int id_b = index(x, 0);
+        rho[id_b] = 1.0; ux[id_b] = 0.0; uy[id_b] = 0.0;
+        for (int k = 0; k < q; ++k) f[next][offset(x, 0, k)] = w[k] * rho[id_b];
+
+        int id_t = index(x, Ny - 1);
+        rho[id_t] = 1.0; ux[id_t] = 0.0; uy[id_t] = 0.0;
+        for (int k = 0; k < q; ++k) f[next][offset(x, Ny - 1, k)] = w[k] * rho[id_t];
     }
 }
 
