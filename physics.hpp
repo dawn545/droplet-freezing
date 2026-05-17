@@ -27,23 +27,24 @@ private:
     void update_flow_field();
 
     int Nx, Ny;
-    double gamma;      // density ratio rho_s/rho_l
-    double Ste;
-    double Pr;
+    double gamma;      // 固液密度比 rho_s/rho_l
+    double Ste;        // 斯特芬数
+    double Pr;         // 普朗特数
     double dx;
     double dt;
     double rho_l;
     double rho_s;
-    double L;
-    double cp;
-    double tau_f;
-    double tau_g;
-    double tau_h;
-    double wettingAngle;
+    double L;          // 潜热
+    double cp;         // 比热容
+    double tau_f;      // 流场松弛时间
+    double tau_g;      // 相场松弛时间
+    double tau_h;      // 温度场松弛时间
+    double wettingAngle; // 接触角 (弧度)
 
     std::vector<double> phi;
     std::vector<double> T;
     std::vector<double> fs;
+    std::vector<double> fs_old; // 存储上一步的固相分数，用于计算体积膨胀源项
     std::vector<double> rho;
     std::vector<double> p;
     std::vector<double> ux;
@@ -56,10 +57,4 @@ private:
     int next;
 
     static constexpr int q = 9;
-    static constexpr std::array<int, q> cx = {0, 1, 0, -1, 0, 1, -1, -1, 1};
-    static constexpr std::array<int, q> cy = {0, 0, 1, 0, -1, 1, 1, -1, -1};
-    static constexpr std::array<double, q> w = {4.0/9.0,
-                                               1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0,
-                                               1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0};
-    static constexpr std::array<int, q> opp = {0, 3, 4, 1, 2, 7, 8, 5, 6};
 };
