@@ -38,34 +38,38 @@ static void update_pixels() {
         return false;
     };
 
+    // 在 update_pixels 函数内的双重循环中替换原有的颜色判断逻辑：
     for (int y = 0; y < Ny; ++y) {
         for (int x = 0; x < Nx; ++x) {
-            int id = y * Nx + x;
-            double phi_val = phi[id];
-            double fs_val = fs[id];
-            uint8_t r, g, b;
+        int id = y * Nx + x;
+        double phi_val = phi[id];
+        double fs_val = fs[id]; // 获取当前的固相分数
+        
+        uint8_t r, g, b;
 
-            if (y < 3) {
-                // 地面
-                r = 20; g = 20; b = 30;
-            } else if (phi_val > 0.5 && isSolidLiquidInterface(x, y)) {
-                // 固液界面
-                r = 255; g = 60; b = 60;
-            } else if (phi_val > 0.5 && fs_val > 0.5) {
-                // 固相
-                r = 240; g = 240; b = 250;
-            } else if (phi_val > 0.5) {
-                // 液相
-                r = 15; g = 170; b = 230;
-            } else {
-                // 气相
-                r = 5; g = 20; b = 80;
-            }
+        if (phi_val > 0.5) {
+            // 液滴内部：通过固相分数 fs_val 区分水(fs=0)和冰(fs=1)
+            // 水的颜色 (原液相颜色)
+            uint8_t water_r = 15, water_g = 170, water_b = 230;
+            // 冰的颜色 (通常为更亮的浅蓝色或灰白色)
+            uint8_t ice_r = 210, ice_g = 240, ice_b = 255; 
 
-            pixelBuffer[(id * 3) + 0] = r;
-            pixelBuffer[(id * 3) + 1] = g;
-            pixelBuffer[(id * 3) + 2] = b;
+            // 限制 fs_val 在 0.0 到 1.0 之间，防止颜色溢出
+            double fs_clamped = std::max(0.0, std::min(1.0, fs_val));
+
+            // 对冰和水进行线性颜色插值，形成平滑的冻结前沿
+            r = water_r + fs_clamped * (ice_r - water_r);
+            g = water_g + fs_clamped * (ice_g - water_g);
+            b = water_b + fs_clamped * (ice_b - water_b);
+        } else {
+            // 气相
+            r = 5; g = 20; b = 80;
         }
+
+        pixelBuffer[(id * 3) + 0] = r;
+        pixelBuffer[(id * 3) + 1] = g;
+        pixelBuffer[(id * 3) + 2] = b;
+    }
     }
 }
 
