@@ -379,19 +379,36 @@ void LBMSolver::update_flow_field() {
             double uy_loc = uy[id];
             double u2 = ux_loc*ux_loc + uy_loc*uy_loc;
 
+            // 1. 获取基础物理力（表面张力）与质量源项
             double F_x = Fs_x[id];
             double F_y = Fs_y[id];
             double S_val = MassSource[id];
+
+            // 2. 计算压力梯度和密度梯度的中心差分（x方向周期边界，y方向处于内节点安全范围）
+            int xp = (x + 1) % Nx;
+            int xm = (x - 1 + Nx) % Nx;
+            int yp = y + 1;
+            int ym = y - 1;
+
+            double grad_p_x = (p[index(xp, y)] - p[index(xm, y)]) / (2.0 * dx);
+            double grad_p_y = (p[index(x, yp)] - p[index(x, ym)]) / (2.0 * dx);
+
+            double grad_rho_x = (rho[index(xp, y)] - rho[index(xm, y)]) / (2.0 * dx);
+            double grad_rho_y = (rho[index(x, yp)] - rho[index(x, ym)]) / (2.0 * dx);
+
+            // 3. 计算广义修正外力项: \tilde{F} = F - \nabla p + c_s^2 * \nabla\rho
+            double F_tilde_x = F_x - grad_p_x + cs2 * grad_rho_x;
+            double F_tilde_y = F_y - grad_p_y + cs2 * grad_rho_y;
 
             for (int k = 0; k < q; ++k) {
                 double cu = cx[k]*ux_loc + cy[k]*uy_loc;
                 double feq = w[k] * rho_loc * (1.0 + cu/cs2 + (cu*cu - cs2*u2)/(2.0*cs2*cs2));
                 
-                // 计算 Guo 氏离散力项 (文献 Eq.33 的变体)
-                double cF = cx[k] * F_x + cy[k] * F_y;
-                double uF = ux_loc * F_x + uy_loc * F_y;
+                // 4. 使用修正后的广义外力 F_tilde 计算 Guo 氏离散力项变体
+                double cF = cx[k] * F_tilde_x + cy[k] * F_tilde_y;
+                double uF = ux_loc * F_tilde_x + uy_loc * F_tilde_y;
                 
-                // 加入质量源项和力项
+                // 加入质量源项和广义修正力项
                 double Fi = w[k] * (S_val + cF/cs2 + (cF*cu - cs2*uF)/(cs2*cs2));
 
                 f_post[offset(x,y,k)] = f[current][offset(x,y,k)] - 
