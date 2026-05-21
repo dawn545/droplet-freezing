@@ -132,10 +132,12 @@ void LBMSolver::compute_phase_derivatives() {
 }
 
 // 修正后的宏观量计算 (包含体积膨胀源项和力的半步修正)
+// 修正后的宏观量计算 (包含体积膨胀源项、宏观力修正以及压力重构)
 void LBMSolver::compute_macros() {
     compute_phase_derivatives();
 
     Eigen::Map<Array2D> rho_map(rho.data(), Ny, Nx);
+    Eigen::Map<Array2D> p_map(p.data(), Ny, Nx); // 增加压力映射
     Eigen::Map<Array2D> ux_map(ux.data(), Ny, Nx);
     Eigen::Map<Array2D> uy_map(uy.data(), Ny, Nx);
     Eigen::Map<Array2D> fs_map(fs.data(), Ny, Nx);
@@ -154,8 +156,9 @@ void LBMSolver::compute_macros() {
     Array2D rho_temp = Array2D::Zero(Ny, Nx);
     Array2D mom_x = Array2D::Zero(Ny, Nx);
     Array2D mom_y = Array2D::Zero(Ny, Nx);
+    Array2D sum_f_neq_0 = Array2D::Zero(Ny, Nx); // 用于压力重构的 \sum_{i\ne0} f_i
 
-    // 统计 0 阶和 1 阶矩
+    // 统计 0 阶和 1 阶矩，以及非零分量的分布函数和
     for (int k = 0; k < q; ++k) {
         for(int y = 0; y < Ny; ++y){
             for(int x = 0; x < Nx; ++x){
@@ -163,6 +166,9 @@ void LBMSolver::compute_macros() {
                 rho_temp(y, x) += f_val;
                 mom_x(y, x) += f_val * cx[k];
                 mom_y(y, x) += f_val * cy[k];
+                if (k != 0) {
+                    sum_f_neq_0(y, x) += f_val;
+                }
             }
         }
     }
@@ -180,6 +186,62 @@ void LBMSolver::compute_macros() {
     // 流固边界处理：直接将完全固态节点速度置 0 (简化阻尼力计算)
     ux_map = (fs_map > 0.5).select(0.0, ux_map);
     uy_map = (fs_map > 0.5).select(0.0, uy_map);
+
+    // =================================================================================
+    // 依据文献重构压力 p (解耦大密度比带来的压力突变)
+    // =================================================================================
+    
+    // 1. 获取上一时间步的压力和密度梯度（用于估算广义外力 \tilde{F}）
+    Array2D grad_p_x = Array2D::Zero(Ny, Nx);
+    Array2D grad_p_y = Array2D::Zero(Ny, Nx);
+    Array2D grad_rho_x = Array2D::Zero(Ny, Nx);
+    Array2D grad_rho_y = Array2D::Zero(Ny, Nx);
+
+    for(int y = 1; y < Ny - 1; ++y) {
+        for(int x = 0; x < Nx; ++x) {
+            int xp = (x + 1) % Nx;
+            int xm = (x - 1 + Nx) % Nx;
+            
+            grad_p_x(y, x) = (p[index(xp, y)] - p[index(xm, y)]) / (2.0 * dx);
+            grad_p_y(y, x) = (p[index(x, y+1)] - p[index(x, y-1)]) / (2.0 * dx);
+            
+            grad_rho_x(y, x) = (rho[index(xp, y)] - rho[index(xm, y)]) / (2.0 * dx);
+            grad_rho_y(y, x) = (rho[index(x, y+1)] - rho[index(x, y-1)]) / (2.0 * dx);
+        }
+    }
+
+    double w0 = w[0];
+    
+    // 2. 计算各内节点的重构压力
+    for(int y = 1; y < Ny - 1; ++y) {
+        for(int x = 0; x < Nx; ++x) {
+            double ux_loc = ux_map(y, x);
+            double uy_loc = uy_map(y, x);
+            double u2 = ux_loc * ux_loc + uy_loc * uy_loc;
+            
+            // 计算广义修正外力项 \tilde{F}
+            double F_tilde_x = Fsx_map(y, x) - grad_p_x(y, x) + cs2 * grad_rho_x(y, x);
+            double F_tilde_y = Fsy_map(y, x) - grad_p_y(y, x) + cs2 * grad_rho_y(y, x);
+            
+            double S_val = src_map(y, x);
+            
+            // 计算 0 阶离散力项 F_0 = \omega_0 (S - \tilde{F} \cdot u / c_s^2)
+            double F0 = w0 * (S_val - (ux_loc * F_tilde_x + uy_loc * F_tilde_y) / cs2);
+            
+            // 计算 \rho s_0(u) 项: - \rho \omega_0 u^2 / (2 c_s^2)
+            double rho_s0 = -rho_map(y, x) * w0 * u2 / (2.0 * cs2);
+            
+            // 重构压力核心公式
+            // p = c_s^2 / (1 - \omega_0) * [ \sum_{i \ne 0} f_i + dt/2 * S + \tau * dt * F0 + \rho s_0(u) ]
+            p_map(y, x) = (cs2 / (1.0 - w0)) * (sum_f_neq_0(y, x) + 0.5 * dt * S_val + tau_f * dt * F0 + rho_s0);
+        }
+    }
+
+    // 3. 上下边界的压力零梯度外推（防止边界出现伪压力波动）
+    for(int x = 0; x < Nx; ++x) {
+        p_map(0, x) = p_map(1, x);
+        p_map(Ny-1, x) = p_map(Ny-2, x);
+    }
 }
 
 void LBMSolver::compute_div_u_and_dphiudt(int x, int y, double& div_u, double& dphiux_dt, double& dphiuy_dt) {
