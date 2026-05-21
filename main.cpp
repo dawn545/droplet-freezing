@@ -1,16 +1,16 @@
 #include "physics.hpp"
 #include "rendering.hpp"
 #include <GL/freeglut.h>
-#include <iostream>
 
 LBMSolver* solver = nullptr;
 
 int main(int argc, char** argv) {
+    // 网格分辨率：x方向200，y方向100
     int Nx = 200;
     int Ny = 100;
-    double gamma = 0.92;   // 冰水密度比 (水结冰膨胀)
-    double Ste = 0.1;      // Stefan 数 (影响冷壁温度，但这里未直接使用，可后续扩展)
-    double Pr = 7.25;      // 水的 Prandtl 数
+    double gamma = 0.92;   // ρ_s/ρ_l，水结冰时密度比 < 1，体积膨胀（论文 Eq.(19)）
+    double Ste = 0.1;      // Stefan 数，定义见论文 Eq.(42)
+    double Pr = 7.25;      // Prandtl 数，定义见论文 Eq.(42)
 
     solver = new LBMSolver(Nx, Ny, gamma, Ste, Pr);
     ::solver = solver;
