@@ -24,11 +24,12 @@ static void update_pixels() {
             int id = y * Nx + x;
             double phi_val = phi[id];
             double fs_val = fs[id];
+            // 节点实际固相占比 = phi * fs（phi 是液-固混合占比，fs 是混合中固相占比）
+            double solid_frac = phi_val * fs_val;
 
             uint8_t r, g, b;
             if (phi_val > 0.5) {
-                // 液相/固相液滴内部：取消渐变，直接根据固相率二值化切换
-                if (fs_val > 0.5) {
+                if (solid_frac > 0.4) {
                     // 冰晶（灰白色）
                     r = 210; g = 240; b = 255;
                 } else {
@@ -36,7 +37,7 @@ static void update_pixels() {
                     r = 255; g = 50; b = 50;
                 }
             } else {
-                // 气相/环境颜色（保持不变）
+                // 气相/环境颜色
                 r = 5; g = 20; b = 80;
             }
 
@@ -85,7 +86,7 @@ void display() {
 
 void timer_callback(int value) {
     if (!solver) return;
-    solver->step(4);
+    solver->step(20);
     glutPostRedisplay();
     glutTimerFunc(16, timer_callback, 0);
 }
