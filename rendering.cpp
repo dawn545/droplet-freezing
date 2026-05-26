@@ -13,7 +13,7 @@ static GLuint textureID;
 
 struct Float3 { float r, g, b; };
 
-// 重新引入高效的线性插值工具
+// 基础线性插值 (用于颜色混合)
 static Float3 lerp(const Float3& c1, const Float3& c2, float t) {
     t = std::max(0.0f, std::min(1.0f, t));
     return {
@@ -23,6 +23,58 @@ static Float3 lerp(const Float3& c1, const Float3& c2, float t) {
     };
 }
 
+// 核心魔法：平滑阶跃函数 (Cubic Hermite)
+// 它能将硬梆梆的线性边缘转化为完美的 S 型平滑曲线，彻底干掉毛边
+static float smoothstep(float edge0, float edge1, float x) {
+    float t = std::max(0.0f, std::min(1.0f, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Catmull-Rom 三次插值权重 (a = -0.5)
+// 与双线性相比提供 C1 连续，可消除斜向网格台阶
+static inline void catmull_rom_weights(float t, float w[4]) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+    w[0] = -0.5f * t  + 1.0f * t2 - 0.5f * t3;
+    w[1] =  1.0f      - 2.5f * t2 + 1.5f * t3;
+    w[2] =  0.5f * t  + 2.0f * t2 - 1.5f * t3;
+    w[3] =             -0.5f * t2 + 0.5f * t3;
+}
+
+static inline int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// 双三次采样（Catmull-Rom）：在网格 (Nx, Ny) 上对连续坐标 (gx, gy) 求值
+static inline float bicubic_sample(const std::vector<double>& field,
+                                   int Nx, int Ny, float gx, float gy) {
+    int ix = static_cast<int>(std::floor(gx));
+    int iy = static_cast<int>(std::floor(gy));
+    float tx = gx - ix;
+    float ty = gy - iy;
+
+    float wx[4], wy[4];
+    catmull_rom_weights(tx, wx);
+    catmull_rom_weights(ty, wy);
+
+    float result = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        int y = clampi(iy - 1 + j, 0, Ny - 1);
+        const double* row = &field[static_cast<size_t>(y) * Nx];
+        float row_sum = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            int x = clampi(ix - 1 + i, 0, Nx - 1);
+            row_sum += wx[i] * static_cast<float>(row[x]);
+        }
+        result += wy[j] * row_sum;
+    }
+    return result;
+}
+
+// 每像素超采样阶数（SS x SS 子采样，2 => 4 样本/像素）
+// 配合 Catmull-Rom 双三次插值，4 样本已足够给出干净的丝滑边缘
+static constexpr int SS = 2;
+
 static void update_pixels() {
     if (!solver) return;
     int Nx = solver->getNx();
@@ -30,54 +82,82 @@ static void update_pixels() {
     const auto& phi = solver->getPhi();
     const auto& fs = solver->getFs();
 
-    if ((int)pixelBuffer.size() != Nx * Ny * 4) {
-        pixelBuffer.assign(Nx * Ny * 4, 0);
+    if ((int)pixelBuffer.size() != windowWidth * windowHeight * 4) {
+        pixelBuffer.assign(windowWidth * windowHeight * 4, 0);
     }
 
-    // 颜色配置（保持高对比度）
-    Float3 colorGas = { 5.0f / 255.0f, 20.0f / 255.0f, 80.0f / 255.0f };   // 外部气相 (深蓝)
-    Float3 colorLiq = { 255.0f / 255.0f, 50.0f / 255.0f, 50.0f / 255.0f }; // 液态水 (红)
-    Float3 colorIce = { 210.0f / 255.0f, 240.0f / 255.0f, 255.0f / 255.0f };// 固态冰 (灰白)
+    // 颜色定义保持你的经典设定
+    const Float3 colorGas = { 5.0f / 255.0f, 20.0f / 255.0f, 80.0f / 255.0f };
+    const Float3 colorLiq = { 255.0f / 255.0f, 50.0f / 255.0f, 50.0f / 255.0f };
+    const Float3 colorIce = { 220.0f / 255.0f, 220.0f / 255.0f, 220.0f / 255.0f };
 
-    for (int y = 0; y < Ny; ++y) {
-        for (int x = 0; x < Nx; ++x) {
-            int id = y * Nx + x;
-            float phi_val = static_cast<float>(phi[id]); 
-            float fs_val = static_cast<float>(fs[id]);   
+    const float invW = 1.0f / static_cast<float>(windowWidth);
+    const float invH = 1.0f / static_cast<float>(windowHeight);
+    const float subStep = 1.0f / static_cast<float>(SS);
+    const float subOffset = 0.5f * subStep;       // 子采样格的中心
+    const float invSamples = 1.0f / static_cast<float>(SS * SS);
 
-            // 1. 解决冰边界“分节、粗糙”问题
-            // 物理场中的 fs 往往是阶跃式的块状，我们用稍宽的窗口 [0.2, 0.8] 将断裂的网格无缝融合成平滑的晶面
-            float fs_t = (fs_val - 0.2f) / (0.8f - 0.2f);
-            fs_t = std::max(0.0f, std::min(1.0f, fs_t));
-            Float3 dropletColor = lerp(colorLiq, colorIce, fs_t);
+    for (int Y = 0; Y < windowHeight; ++Y) {
+        for (int X = 0; X < windowWidth; ++X) {
+            float accR = 0.0f, accG = 0.0f, accB = 0.0f;
 
-            // 2. 解决外边界“大范围发晕”与“硬切大锯齿”的矛盾
-            // 采用极窄通道 [0.46, 0.54]。这在屏幕上只占 1~2 像素过渡
-            // 既能保证边界看起来清晰锐利（没有晕圈），又实现了完美的曲线抗锯齿（消除方块感）
-            float phi_t = (phi_val - 0.46f) / (0.54f - 0.46f);
-            phi_t = std::max(0.0f, std::min(1.0f, phi_t));
-            Float3 finalColor = lerp(colorGas, dropletColor, phi_t);
+            // SS x SS 子采样 + Catmull-Rom 双三次重建
+            for (int sy = 0; sy < SS; ++sy) {
+                float fY = (static_cast<float>(Y) + subOffset + sy * subStep) * invH;
+                float gy = fY * (Ny - 1);
 
-            // 3. 数据打包
-            auto toByte = [](float v) -> uint8_t { return static_cast<uint8_t>(v * 255.0f); };
-            pixelBuffer[(id * 4) + 0] = toByte(finalColor.r);
-            pixelBuffer[(id * 4) + 1] = toByte(finalColor.g);
-            pixelBuffer[(id * 4) + 2] = toByte(finalColor.b);
-            pixelBuffer[(id * 4) + 3] = 255; 
+                for (int sx = 0; sx < SS; ++sx) {
+                    float fX = (static_cast<float>(X) + subOffset + sx * subStep) * invW;
+                    float gx = fX * (Nx - 1);
+
+                    float phi_val = bicubic_sample(phi, Nx, Ny, gx, gy);
+                    float fs_val  = bicubic_sample(fs,  Nx, Ny, gx, gy);
+
+                    // 双三次会有微小越界，钳位到合法范围
+                    if (phi_val < 0.0f) phi_val = 0.0f; else if (phi_val > 1.0f) phi_val = 1.0f;
+                    if (fs_val  < 0.0f) fs_val  = 0.0f; else if (fs_val  > 1.0f) fs_val  = 1.0f;
+
+                    float phi_t = smoothstep(0.42f, 0.58f, phi_val);
+                    float solid_frac = phi_val * fs_val;
+                    float fs_t = smoothstep(0.2f, 0.6f, solid_frac);
+
+                    Float3 dropletColor = lerp(colorLiq, colorIce, fs_t);
+                    Float3 finalColor = lerp(colorGas, dropletColor, phi_t);
+
+                    accR += finalColor.r;
+                    accG += finalColor.g;
+                    accB += finalColor.b;
+                }
+            }
+
+            accR *= invSamples;
+            accG *= invSamples;
+            accB *= invSamples;
+
+            int pixel_id = Y * windowWidth + X;
+            auto toByte = [](float v) -> uint8_t {
+                if (v < 0.0f) v = 0.0f; else if (v > 1.0f) v = 1.0f;
+                return static_cast<uint8_t>(v * 255.0f + 0.5f);
+            };
+            pixelBuffer[(pixel_id * 4) + 0] = toByte(accR);
+            pixelBuffer[(pixel_id * 4) + 1] = toByte(accG);
+            pixelBuffer[(pixel_id * 4) + 2] = toByte(accB);
+            pixelBuffer[(pixel_id * 4) + 3] = 255;
         }
     }
 
     glBindTexture(GL_TEXTURE_2D, textureID);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, Nx, Ny, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixelBuffer.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, windowWidth, windowHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixelBuffer.data());
 }
 
+// === 下方的 initialize_rendering, display, timer_callback 保持不变 ===
 void initialize_rendering(int argc, char** argv, int width, int height) {
     windowWidth = width;
     windowHeight = height;
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(windowWidth, windowHeight);
-    glutCreateWindow("Phase-field LBM - Subpixel Anti-Aliased Rendering");
+    glutCreateWindow("Phase-field LBM - Smoothstep Anti-Aliased");
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glMatrixMode(GL_PROJECTION);
@@ -87,7 +167,7 @@ void initialize_rendering(int argc, char** argv, int width, int height) {
     glLoadIdentity();
 
     glEnable(GL_TEXTURE_2D);
-    glGenTextures(1, &textureID);
+    glGenTextures(1, &textureID); 
     glBindTexture(GL_TEXTURE_2D, textureID);
     
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
