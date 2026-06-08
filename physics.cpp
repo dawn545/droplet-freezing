@@ -28,7 +28,7 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
       Ts(0.5), Tl(0.5), Tm(0.5),
         // 表面张力参数
       sigma(0.005), W(2.0), M(0.01),
-      wettingAngle(30.0 * M_PI / 180.0),
+      wettingAngle(90.0 * M_PI / 180.0),
         // 数组初始化
       current(0), next(1),
       phi(nx*ny, 0.0), fs(nx*ny, 0.0), fl(nx*ny, 0.0),
@@ -54,15 +54,10 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
     double c = dx / dt;
     cs2 = c * c / 3.0;
 
-    // 流场弛豫时间：仅作初值参考；实际碰撞使用每节点本地 τ_loc（由 mu_mix/ρ 算出）
-    tau_f = 0.8;
-    // 相场弛豫时间（由迁移率 M 决定：M = cs2*(tau_g-0.5)*dt）
+    // 相场弛豫时间（由迁移率 M 决定：M = cs2*(tau_g-0.5)*dt，论文 Eq.21 之后）
     tau_g = M / (cs2 * dt) + 0.5;
     tau_g = std::max(tau_g, 0.6);   // 防止 tau_g 太接近 0.5 临界，数值不稳
-    // 温度场弛豫时间（由热扩散系数 α = k/(ρ Cp) 决定）
-    double alpha = k_l / (rho_l * Cp_l);   // 液体热扩散系数
-    tau_h = alpha / (cs2 * dt) + 0.5;
-    tau_h = std::max(tau_h, 0.75);
+    // 流场和温度场弛豫时间在 update_flow_field / update_temperature 内由 mu_mix、k_mix 逐点计算
 
     // 表面张力参数（式13）
     beta = 12.0 * sigma / W;
@@ -91,10 +86,12 @@ void LBMSolver::update_mixture_properties() {
             Cp_mix[id] = fs_val * Cp_s + fl_val * phi_val * Cp_l + fl_val * (1.0 - phi_val) * Cp_g;
             // 导热系数
             k_mix[id] = fs_val * k_s + fl_val * phi_val * k_l + fl_val * (1.0 - phi_val) * k_g;
-            // 动力粘度（气相小，液相由 Pr 决定，固相用 100·μ_l 让 τ_loc 有界）
+            // 动力粘度：液相由 Pr 决定；论文未给固相/气相 μ
+            //  - 固相：取 μ_s = μ_l，因为速度由 immersed-boundary 控制 (论文 Eq.20 后说明)
+            //  - 气相：与液相同 Pr 下 μ_g = Pr·k_g/Cp_g = 0.1·μ_l
             double mu_l = Pr * k_l / Cp_l;
-            double mu_g = 0.01 * mu_l;
-            double mu_s = 100.0 * mu_l;
+            double mu_g = Pr * k_g / Cp_g;
+            double mu_s = mu_l;
             mu_mix[id] = fs_val * mu_s + fl_val * phi_val * mu_l + fl_val * (1.0 - phi_val) * mu_g;
         }
     }
@@ -102,12 +99,13 @@ void LBMSolver::update_mixture_properties() {
 
 // ==================== 计算流固耦合力（扩散界面法） ====================
 void LBMSolver::compute_fluid_solid_interaction() {
-    // 论文式(20)后说明：f = ε_s · ρ · (u_s - u*)/Δt
-    // 用 effective_fs = phi·fs 作为节点实际固相占比，避免液-气界面误启动力源
+    // paper.md inline (Eq.20 下方): f = f_s · (u_s - u*) / Δt （加速度）
+    // 代码中的 fx[i] 表示 ρf（force per volume），用于 Eq.(33) 的 ci·(F+ρf)/cs² 项
+    // 故 fx[i] = ρ · f_s · (u_s - u*) / Δt
     for (int i = 0; i < Nx*Ny; ++i) {
-        double eff_fs = phi[i] * fs[i];
+        double fs_loc = fs[i];
         double rho_loc = rho_mix[i];
-        double factor = rho_loc * eff_fs * (1.0 - eff_fs) / dt;
+        double factor = rho_loc * fs_loc / dt;
         fx[i] = factor * (ux_solid[i] - ux_star[i]);
         fy[i] = factor * (uy_solid[i] - uy_star[i]);
     }
@@ -149,19 +147,6 @@ void LBMSolver::compute_lambda_and_normal() {
             double phi_val = phi[id];
             lambda[id] = 4.0 * phi_val * (1.0 - phi_val) / W;
         }
-    }
-}
-
-// ==================== 计算 ∂(φu)/∂t (一阶显式欧拉) ====================
-void LBMSolver::compute_dphiudt() {
-    for (int i = 0; i < Nx*Ny; ++i) {
-        double phi_ux = phi[i] * ux[i];
-        double phi_uy = phi[i] * uy[i];
-        double dphiux_dt = (phi_ux - phi_ux_prev[i]) / dt;
-        double dphiuy_dt = (phi_uy - phi_uy_prev[i]) / dt;
-        phi_ux_prev[i] = phi_ux;
-        phi_uy_prev[i] = phi_uy;
-        // 这里需要存储到某个数组供相场使用，暂时不存，在 update_phase_field 中直接计算
     }
 }
 
@@ -240,8 +225,11 @@ void LBMSolver::compute_macros() {
     // 密度由物性公式（论文式1，update_mixture_properties 已算）控制，不从 Σf 反推
     // 该 LB 形式（Yuan 2020）中 Σf ≠ ρ，强制覆盖会让 ρ 跌至 0 → 数值崩溃
     rho_map = rho_map.max(1e-12);
-    ux_star_map = (mom_x + 0.5 * dt * Fsx_map) / rho_map;
-    uy_star_map = (mom_y + 0.5 * dt * Fsy_map) / rho_map;
+    // 论文 Eq.34: u* = Σci f_i + (Δt/2)·F，F = Fs + G
+    Eigen::Map<Array2D> Gx_map(Gx.data(), Ny, Nx);
+    Eigen::Map<Array2D> Gy_map(Gy.data(), Ny, Nx);
+    ux_star_map = (mom_x + 0.5 * dt * (Fsx_map + Gx_map)) / rho_map;
+    uy_star_map = (mom_y + 0.5 * dt * (Fsy_map + Gy_map)) / rho_map;
 
     // 计算流固耦合力
     compute_fluid_solid_interaction();
@@ -293,25 +281,27 @@ void LBMSolver::compute_macros() {
         }
     }
 
-    // 4. 计算最终压力 p
+    // 4. 计算最终压力 p (论文 Eq.36)
     double w0 = w[0];
     for (int y = 0; y < Ny; ++y) {
         for (int x = 0; x < Nx; ++x) {
+            int id = index(x, y);
             double ux_loc = ux_map(y, x);
             double uy_loc = uy_map(y, x);
             double u2 = ux_loc*ux_loc + uy_loc*uy_loc;
-            
-            // 补全修正力 F_tilde 中的 c_s^2 ∇S 项
-            double F_tilde_x = Fsx_map(y, x) - grad_p_x(y, x) + cs2 * grad_rho_x(y, x) + cs2 * grad_S_x(y, x);
-            double F_tilde_y = Fsy_map(y, x) - grad_p_y(y, x) + cs2 * grad_rho_y(y, x) + cs2 * grad_S_y(y, x);
-            
+
+            // F̃ = F - ∇p + cs²∇ρ + cs²∇S，F = Fs + G（不含 f）
+            double F_tilde_x = Fsx_map(y, x) + Gx_map(y, x) - grad_p_x(y, x) + cs2 * grad_rho_x(y, x) + cs2 * grad_S_x(y, x);
+            double F_tilde_y = Fsy_map(y, x) + Gy_map(y, x) - grad_p_y(y, x) + cs2 * grad_rho_y(y, x) + cs2 * grad_S_y(y, x);
+
             double S_val = S_map(y, x);
             double F0 = w0 * (S_val - (ux_loc*F_tilde_x + uy_loc*F_tilde_y)/cs2);
-            double rho_s0 = -rho_map(y, x) * w0 * u2 / (2.0 * cs2);
-            // 本地弛豫时间：按 fs 和 phi 加权（多相 LB 标准做法，论文式42 精神）
-            const double tau_l = 0.8, tau_g = 1.0, tau_s = 3.0;
-            double fs_loc = fs[index(x,y)], phi_loc = phi[index(x,y)], fl_loc = 1.0 - fs_loc;
-            double tau_loc = fs_loc*tau_s + fl_loc*phi_loc*tau_l + fl_loc*(1.0-phi_loc)*tau_g;
+            double rho_s0 = rho_map(y, x) * w[0] * (- u2 / (2.0 * cs2));
+            // paper.md inline τ_f = ν/(cs²·Δt) + 0.5，ν = mu_mix/ρ
+            int id_p = index(x, y);
+            double tau_loc = mu_mix[id_p] / (rho_map(y,x) * cs2 * dt) + 0.5;
+            tau_loc = std::max(tau_loc, 0.51);
+            // paper.md Eq.(36): p = (cs²/(1-ω_0))·[Σ_{i≠0}f_i + (Δt/2)·S + τ·Δt·F_0 + ρ·s_0(u)]
             p_map(y, x) = (cs2 / (1.0 - w0)) * (sum_f_neq_0(y, x) + 0.5*dt*S_val + tau_loc*dt*F0 + rho_s0);
         }
     }
@@ -446,45 +436,20 @@ void LBMSolver::update_phase_field() {
     }
 }
 
+
 // ==================== 温度场更新（焓法 LB） ====================
 void LBMSolver::update_temperature() {
     std::vector<double> h_post(Nx*Ny*q, 0.0);
 
-    // 先设置边界分布（底部和顶部）
-    for (int x = 0; x < Nx; ++x) {
-        // 底部：T=0，完全固态 fs=1
-        double T_wall = 0.0, fs_wall = 1.0;
-        double H_wall = Cp_ref * T_wall + L * (1.0 - fs_wall);
-        for (int k = 0; k < q; ++k) {
-            if (k == 0)
-                h_post[offset(x,0,k)] = H_wall - Cp_ref * T_wall + w[k] * Cp_ref * T_wall;
-            else
-                h_post[offset(x,0,k)] = w[k] * Cp_ref * T_wall;
-        }
-        // 顶部：T=1，完全液态 fs=0
-        double T_top = 1.0, fs_top = 0.0;
-        double H_top = Cp_ref * T_top + L * (1.0 - fs_top);
-        for (int k = 0; k < q; ++k) {
-            if (k == 0)
-                h_post[offset(x,Ny-1,k)] = H_top - Cp_ref * T_top + w[k] * Cp_ref * T_top;
-            else
-                h_post[offset(x,Ny-1,k)] = w[k] * Cp_ref * T_top;
-        }
-    }
-
-    // 内部节点碰撞
+    // 内部节点碰撞 (保持原样)
     for (int y = 1; y < Ny-1; ++y) {
         for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
             double ux_loc = ux[id], uy_loc = uy[id];
-            double u2 = ux_loc*ux_loc + uy_loc*uy_loc;
 
-            // 计算当前总焓 H
             double H_curr = 0.0;
             for (int k = 0; k < q; ++k) H_curr += h[current][offset(x,y,k)];
 
-            // 由 H 反求 fs 和 T（焓法，论文式 9a/9b）
-            // phi<0.5 视为气相主导：不发生液-固相变
             const double Hs_val = Cp_s * Ts;
             const double Hl_val = Cp_l * Tl + L;
             double phi_v = phi[id];
@@ -507,40 +472,42 @@ void LBMSolver::update_temperature() {
             fs_curr = std::clamp(fs_curr, 0.0, 1.0);
             T_curr = std::clamp(T_curr, 0.0, 1.0);
 
-            // ... (前面反求 fs_curr 和 T_curr 的代码保持不变) ...
-
-            // 在计算平衡分布前，先获取当地的比热容
-            double phi_val = phi[id];
             double fl_curr = 1.0 - fs_curr;
-            double Cp_loc = fs_curr * Cp_s + fl_curr * phi_val * Cp_l + fl_curr * (1.0 - phi_val) * Cp_g;
+            double Cp_loc = fs_curr * Cp_s + fl_curr * phi_v * Cp_l + fl_curr * (1.0 - phi_v) * Cp_g;
 
-            // 计算平衡分布 heq (式28)
             std::array<double, q> heq;
             compute_heq(H_curr, T_curr, Cp_ref, Cp_loc, ux_loc, uy_loc, heq);
 
-            // 本地 tau_h（论文式42 精神，按相态加权 α=k/(ρCp)）
-            // α_l ≈ 1 → τ=0.8；α_s ≈ 8.3 → τ≈2.98；α_g ≈ 1 → τ=0.8
-            const double tau_h_l = 0.8, tau_h_s = 3.0, tau_h_g = 0.8;
-            double fl_loc_h = 1.0 - fs_curr;
-            double tau_h_local = fs_curr*tau_h_s + fl_loc_h*phi_v*tau_h_l + fl_loc_h*(1.0-phi_v)*tau_h_g;
+            double tau_h_local = k_mix[id] / (Cp_ref * cs2 * dt) + 0.5;
+            tau_h_local = std::max(tau_h_local, 0.51);
 
-            // 碰撞 (式27)
             for (int k = 0; k < q; ++k) {
                 h_post[offset(x,y,k)] = h[current][offset(x,y,k)] - (h[current][offset(x,y,k)] - heq[k]) / tau_h_local;
             }
-
-            fs[id] = fs_curr;
-            T[id] = T_curr;
         }
     }
 
-    // 迁移（streaming）
+    // 迁移（streaming）：引入局部边界判断
     for (int y = 1; y < Ny-1; ++y) {
         for (int x = 0; x < Nx; ++x) {
             for (int k = 0; k < q; ++k) {
                 int sx = (x - cx[k] + Nx) % Nx;
                 int sy = y - cy[k];
-                h[next][offset(x,y,k)] = h_post[offset(sx,sy,k)];
+                if (sy == Ny-1) {
+                    h[next][offset(x,y,k)] = h_post[offset(x,y,opp[k])];
+                } else if (sy == 0) {
+                    // ======= COMSOL 边界核心：判断当前位置是否为液滴 =======
+                    double phi_bottom = phi[index(sx, 0)];
+                    if (phi_bottom > 0.5) {
+                        // 液滴接触面：冷板 (T=0)
+                        h[next][offset(x,y,k)] = -h_post[offset(x,y,opp[k])] + 2.0 * w[k] * Cp_ref * 0.0;
+                    } else {
+                        // 空气接触面：绝热 (半步反弹近似)
+                        h[next][offset(x,y,k)] = h_post[offset(x,y,opp[k])];
+                    }
+                } else {
+                    h[next][offset(x,y,k)] = h_post[offset(sx,sy,k)];
+                }
             }
         }
     }
@@ -574,12 +541,29 @@ void LBMSolver::update_temperature() {
         }
     }
 
-    // 强制边界
+    // 边界宏观量
     for (int x = 0; x < Nx; ++x) {
-        int id_b = index(x,0);
-        T[id_b] = 0.0; fs[id_b] = 1.0;
-        int id_t = index(x,Ny-1);
-        T[id_t] = 1.0; fs[id_t] = 0.0;
+        int id_b = index(x, 0);
+        int id_b_up = index(x, 1);
+        double phi_b = phi[id_b];
+        
+        // ======= 底部物理宏观量强迫 =======
+        if (phi_b > 0.5) {
+            T[id_b] = 0.0;    // 液滴接触面强迫为冷源
+            fs[id_b] = 1.0;   // 强迫为纯冰
+            H[id_b] = 0.0; 
+        } else {
+            T[id_b] = T[id_b_up]; // 气体区域绝热，温度等于上一层
+            fs[id_b] = 0.0;
+            H[id_b] = Cp_g * T[id_b];
+        }
+
+        // 顶部绝热：拷贝最近内部节点
+        int id_t = index(x, Ny-1);
+        int id_t_in = index(x, Ny-2);
+        T[id_t] = T[id_t_in];
+        fs[id_t] = fs[id_t_in];
+        H[id_t] = H[id_t_in];
     }
 }
 
@@ -597,14 +581,15 @@ void LBMSolver::update_flow_field() {
             double ux_loc = ux[id], uy_loc = uy[id];
             double u2 = ux_loc*ux_loc + uy_loc*uy_loc;
 
-            // 总力：表面张力 + 体积力 + 流固耦合（论文式20）
-            double F_x = Fs_x[id] + Gx[id] + fx[id];
-            double F_y = Fs_y[id] + Gy[id] + fy[id];
+            // 论文 Eq.33: F = Fs + G (不含 f)；二项用 (F+f)，三项用 F̃
+            double F_x = Fs_x[id] + Gx[id];
+            double F_y = Fs_y[id] + Gy[id];
+            double Ff_x = F_x + fx[id];   // (F+f) 用于第二项 ci·(F+f)/cs²
+            double Ff_y = F_y + fy[id];
 
-            // 本地弛豫时间：按 fs 和 phi 加权（多相 LB 标准做法，论文式42 精神）
-            const double tau_l = 0.8, tau_g = 1.0, tau_s = 3.0;
-            double fs_loc = fs[id], phi_loc = phi[id], fl_loc = 1.0 - fs_loc;
-            double tau_loc = fs_loc*tau_s + fl_loc*phi_loc*tau_l + fl_loc*(1.0-phi_loc)*tau_g;
+            // 本地弛豫时间 τ_f = ν/(cs²·dt) + 0.5，ν = mu_mix/ρ (论文 Eq.30 后说明)
+            double tau_loc = mu_mix[id] / (rho_loc * cs2 * dt) + 0.5;
+            tau_loc = std::max(tau_loc, 0.51);
 
             // 计算 ∇p, ∇ρ 和 ∇S
             int xp = (x+1)%Nx, xm = (x-1+Nx)%Nx;
@@ -616,17 +601,16 @@ void LBMSolver::update_flow_field() {
             double grad_S_x = (S_field[index(xp,y)] - S_field[index(xm,y)]) / (2.0*dx);
             double grad_S_y = (S_field[index(x,yp)] - S_field[index(x,ym)]) / (2.0*dx);
 
-            // F̃ = F - ∇p + c_s² ∇ρ + c_s² ∇S (补全式33的完整定义)
+            // F̃ = F - ∇p + cs²∇ρ + cs²∇S，F = Fs+G（不含 f）
             double F_tilde_x = F_x - grad_p_x + cs2 * grad_rho_x + cs2 * grad_S_x;
             double F_tilde_y = F_y - grad_p_y + cs2 * grad_rho_y + cs2 * grad_S_y;
 
-            double S_val = S_field[id]; // 使用全局补全的 S 而不是仅包含 m_dot 的值
+            double S_val = S_field[id];
 
-            // 流固耦合力已经包含在速度修正中，这里不再重复加
             for (int k = 0; k < q; ++k) {
                 double cu = cx[k]*ux_loc + cy[k]*uy_loc;
-                
-                // --- 修正后的平衡分布计算 (论文式31, 32) ---
+
+                // 平衡分布 (论文式31, 32)
                 double s_i = w[k] * (cu/cs2 + (cu*cu)/(2.0*cs2*cs2) - u2/(2.0*cs2));
                 double feq;
                 if (k == 0) {
@@ -634,12 +618,13 @@ void LBMSolver::update_flow_field() {
                 } else {
                     feq = (p[id] / cs2) * w[k] + rho_loc * s_i;
                 }
-                // ---------------------------------------
-                
-                // 强迫项 (式33) - 这部分先保持不变
-                double cF = cx[k]*F_tilde_x + cy[k]*F_tilde_y;
-                double uF = ux_loc*F_tilde_x + uy_loc*F_tilde_y;
-                double Fi = w[k] * (S_val + cF/cs2 + (cF*cu - cs2*uF)/(cs2*cs2));
+
+                // 强迫项 (式33)：第二项 ci·(F+f)/cs²；第三项用 F̃
+                double cFf = cx[k]*Ff_x + cy[k]*Ff_y;          // (F+f)·c
+                double cFt = cx[k]*F_tilde_x + cy[k]*F_tilde_y; // F̃·c
+                double uFt = ux_loc*F_tilde_x + uy_loc*F_tilde_y; // u·F̃
+                double Fi = w[k] * (S_val + cFf/cs2 + (cFt*cu - cs2*uFt)/(cs2*cs2));
+
                 // 碰撞 (式30)
                 f_post[offset(x,y,k)] = f[current][offset(x,y,k)] -
                                         (f[current][offset(x,y,k)] - feq) / tau_loc +
@@ -724,10 +709,20 @@ void LBMSolver::apply_velocity_bc() {
 }
 
 // ==================== 温度边界（恒温） ====================
+// ==================== 温度边界（恒温与绝热混合） ====================
 void LBMSolver::apply_temperature_bc() {
     for (int x = 0; x < Nx; ++x) {
-        T[index(x,0)] = 0.0;
-        T[index(x,Ny-1)] = 1.0;
+        int id_b = index(x, 0);
+        
+        // 只有液滴底下是强迫冷源，外部空气是绝热的
+        if (phi[id_b] > 0.5) {
+            T[id_b] = 0.0;
+        } else {
+            T[id_b] = T[index(x, 1)]; 
+        }
+        
+        // 顶部设为绝热 (Zero-gradient)
+        T[index(x, Ny-1)] = T[index(x, Ny-2)];
     }
 }
 
@@ -737,6 +732,7 @@ void LBMSolver::apply_boundary_conditions() {
     apply_velocity_bc();
     apply_temperature_bc();
 }
+
 
 // ==================== 初始化所有场 ====================
 void LBMSolver::initialize_fields() {
@@ -751,26 +747,47 @@ void LBMSolver::initialize_fields() {
             double dxl = x - centerX;
             double dyl = y - centerY;
             double r = std::sqrt(dxl*dxl + dyl*dyl);
+            
             // 相场初始化：论文式(45) tanh 平滑界面
             phi[id] = 0.5 + 0.5 * std::tanh(2.0 * (R - r) / W);
             phi[id] = std::clamp(phi[id], 0.0, 1.0);
 
-            fs[id] = 0.0;
-            fs_prev[id] = 0.0;
+            // ================= COMSOL 效果核心初始化 =================
+            if (phi[id] > 0.5) {
+                // 1. 液滴内部：最底部铺一层极薄的平齐冰层
+                if (y == 0) {
+                    fs[id] = 1.0;
+                    T[id] = 0.0;   // 贴近冷板，温度为冷源温度
+                } else {
+                    fs[id] = 0.0;
+                    T[id] = 0.6;   // 液体初始温度 (Tm=0.5，略高于熔点防止瞬间全冻)
+                }
+            } else {
+                // 2. 气相环境：没有冰，初始温度与水相同
+                fs[id] = 0.0;
+                T[id] = 0.6;
+            }
+            // =========================================================
+
+            fs_prev[id] = fs[id];
             fl[id] = 1.0 - fs[id];
-            // 全场初温 T = T0 = 1（论文 4.2 节，再让底部冷板瞬间变冷）
-            T[id] = 1.0;
+            
             // 初始总焓：液-固混合区按式(8)，气相只有 sensible heat
             double phi_v = phi[id];
             double H_liq = Cp_l * T[id] + L * (1.0 - fs[id]);
             double H_gas = Cp_g * T[id];
             H[id] = phi_v * H_liq + (1.0 - phi_v) * H_gas;
+            
             ux[id] = uy[id] = 0.0;
             ux_star[id] = uy_star[id] = 0.0;
-            // 混合物性初值与本地 phi/fs 一致（论文式1）
+            
+            // 混合物性初值与本地 phi/fs 一致
             double fs_v = fs[id], fl_v = 1.0 - fs_v;
+            double mu_l_init = Pr * k_l / Cp_l;
+            double mu_g_init = Pr * k_g / Cp_g;
+            double mu_s_init = mu_l_init;
             rho_mix[id] = fs_v*rho_s + fl_v*phi_v*rho_l + fl_v*(1.0-phi_v)*rho_g;
-            mu_mix[id]  = (Pr*k_l/Cp_l) * (fs_v*100.0 + fl_v*phi_v*1.0 + fl_v*(1.0-phi_v)*0.01);
+            mu_mix[id]  = fs_v*mu_s_init + fl_v*phi_v*mu_l_init + fl_v*(1.0-phi_v)*mu_g_init;
             k_mix[id]   = fs_v*k_s + fl_v*phi_v*k_l + fl_v*(1.0-phi_v)*k_g;
             Cp_mix[id]  = fs_v*Cp_s + fl_v*phi_v*Cp_l + fl_v*(1.0-phi_v)*Cp_g;
 
