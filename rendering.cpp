@@ -23,8 +23,8 @@ static Float3 lerp(const Float3& c1, const Float3& c2, float t) {
     };
 }
 
-// 核心魔法：平滑阶跃函数 (Cubic Hermite)
-// 它能将硬梆梆的线性边缘转化为完美的 S 型平滑曲线，彻底干掉毛边
+// 平滑阶跃函数 (Cubic Hermite)
+// 它能将线性边缘转化为完美的 S 型平滑曲线，彻底干掉毛边
 static float smoothstep(float edge0, float edge1, float x) {
     float t = std::max(0.0f, std::min(1.0f, (x - edge0) / (edge1 - edge0)));
     return t * t * (3.0f - 2.0f * t);
