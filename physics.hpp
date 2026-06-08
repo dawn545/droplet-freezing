@@ -81,7 +81,6 @@ private:
     void apply_velocity_bc();                 // 无滑移速度边界
     void apply_temperature_bc();              // 恒温边界 (底部冷壁T=0，顶部热壁T=1)
     void compute_lambda_and_normal();         // 计算 λ = 4φ(1-φ)/W 及界面法向量 n = ∇φ/|∇φ| (式3)
-    void compute_dphiudt();                   // 时间导数 ∂(φu)/∂t 的一阶显式欧拉 (式37)
 
     // ==================== 平衡分布函数 ====================
     // ==================== 平衡分布函数 ====================
@@ -109,7 +108,7 @@ private:
     double wettingAngle;        // 基底接触角 (弧度)
     double beta, kappa;         // 相场参数: β = 12σ/W, κ = 1.5σW (式13)
     double cs2;                 // 声速平方 c_s^2 = c^2/3, c=dx/dt
-    double tau_f, tau_g, tau_h; // 流场、相场、温度场的弛豫时间
+    double tau_g;               // 相场弛豫时间（由迁移率 M 决定）；流场/温度场的 τ 在更新内逐点计算
     double Cp_ref;              // 参考比热 (取液体比热 Cp_l)
 
     // ==================== 宏观场 ====================
