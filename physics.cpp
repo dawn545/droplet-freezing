@@ -56,7 +56,7 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
 
     // 相场弛豫时间（由迁移率 M 决定：M = cs2*(tau_g-0.5)*dt，论文 Eq.21 之后）
     tau_g = M / (cs2 * dt) + 0.5;
-    tau_g = std::max(tau_g, 0.6);   // 防止 tau_g 太接近 0.5 临界，数值不稳
+
     // 流场和温度场弛豫时间在 update_flow_field / update_temperature 内由 mu_mix、k_mix 逐点计算
 
     // 表面张力参数（式13）
@@ -105,7 +105,7 @@ void LBMSolver::compute_fluid_solid_interaction() {
     for (int i = 0; i < Nx*Ny; ++i) {
         double fs_loc = fs[i];
         double rho_loc = rho_mix[i];
-        double factor = rho_loc * fs_loc / dt;
+        double factor = 2 * rho_loc * fs_loc / dt;
         fx[i] = factor * (ux_solid[i] - ux_star[i]);
         fy[i] = factor * (uy_solid[i] - uy_star[i]);
     }
@@ -173,13 +173,16 @@ void LBMSolver::compute_phase_derivatives() {
             lap_phi(y, x) = (phi_l + phi_r + phi_d + phi_u - 4.0*phi_c) / (dx*dx);
         }
     }
-
-    // 化学势 μ_φ = 4β φ(φ-1)(φ-0.5) - κ ∇²φ (式12)
+    
+    // 在函数开头引入液相分数的 Eigen Map
+    Eigen::Map<Array2D> fl_map(fl.data(), Ny, Nx);
+    
+    // ... 前面的梯度与 mu 计算保持不变 ...
     Array2D mu = 4.0 * beta * phi_map * (phi_map - 1.0) * (phi_map - 0.5) - kappa * lap_phi;
 
-    // 表面张力 F_s = μ_φ ∇φ (式11)
-    Fsx_map = mu * grad_x;
-    Fsy_map = mu * grad_y;
+    // 【修正】使用液相分数截断表面张力，防止冰层表面产生伪速度
+    Fsx_map = fl_map * mu * grad_x;
+    Fsy_map = fl_map * mu * grad_y;
 }
 
 // ==================== 从分布函数计算宏观量 ====================
@@ -279,6 +282,19 @@ void LBMSolver::compute_macros() {
             grad_S_x(y, x) = (S_map(y, xp) - S_map(y, xm)) / (2.0*dx);
             grad_S_y(y, x) = (S_map(y+1, x) - S_map(y-1, x)) / (2.0*dx);
         }
+    }
+
+    // 在 3. 计算 S 的梯度 ∇S 循环结束后，补充以下边界梯度处理：
+    for (int x = 0; x < Nx; ++x) {
+        // 底部 y = 0 单边差分
+        grad_p_y(0, x) = (p_map(1, x) - p_map(0, x)) / dx;
+        grad_rho_y(0, x) = (rho_map(1, x) - rho_map(0, x)) / dx;
+        grad_S_y(0, x) = (S_map(1, x) - S_map(0, x)) / dx;
+        
+        // 顶部 y = Ny-1 单边差分
+        grad_p_y(Ny-1, x) = (p_map(Ny-1, x) - p_map(Ny-2, x)) / dx;
+        grad_rho_y(Ny-1, x) = (rho_map(Ny-1, x) - rho_map(Ny-2, x)) / dx;
+        grad_S_y(Ny-1, x) = (S_map(Ny-1, x) - S_map(Ny-2, x)) / dx;
     }
 
     // 4. 计算最终压力 p (论文 Eq.36)
@@ -446,34 +462,42 @@ void LBMSolver::update_temperature() {
         for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
             double ux_loc = ux[id], uy_loc = uy[id];
+            
+            double H_curr = H[id];
 
-            double H_curr = 0.0;
-            for (int k = 0; k < q; ++k) H_curr += h[current][offset(x,y,k)];
-
-            const double Hs_val = Cp_s * Ts;
-            const double Hl_val = Cp_l * Tl + L;
             double phi_v = phi[id];
-            double fs_curr, T_curr;
-            if (phi_v < 0.5) {
+            
+            // 【修正】固相线对应的等效显热容也必须包含气相的贡献！
+            double Cp_sensible_s = phi_v * Cp_s + (1.0 - phi_v) * Cp_g;
+            double Cp_sensible_l = phi_v * Cp_l + (1.0 - phi_v) * Cp_g;
+            
+            const double Hs_val = Cp_sensible_s * Ts;
+            const double Hl_val = Cp_sensible_l * Tl + phi_v * L;
+
+            double fs_curr, T_curr, Cp_loc;
+
+            // 【新增保护】如果处于纯气相或无潜热区域，直接按照显热计算，跳过相变判定
+            if (Hl_val - Hs_val < 1e-6) {
                 fs_curr = 0.0;
-                double Cp_loc_eff = phi_v * Cp_l + (1.0 - phi_v) * Cp_g;
-                T_curr = H_curr / std::max(Cp_loc_eff, 1e-6);
+                T_curr = H_curr / std::max(Cp_sensible_l, 1e-6);
             } else if (H_curr <= Hs_val) {
                 fs_curr = 1.0;
-                T_curr = H_curr / Cp_s;
+                T_curr = H_curr / std::max(Cp_sensible_s, 1e-6);
             } else if (H_curr >= Hl_val) {
                 fs_curr = 0.0;
-                T_curr = (H_curr - L) / Cp_l;
+                T_curr = (H_curr - phi_v * L) / std::max(Cp_sensible_l, 1e-6);
             } else {
                 double fl_local = (H_curr - Hs_val) / (Hl_val - Hs_val);
                 fs_curr = 1.0 - fl_local;
-                T_curr = Ts + fl_local * (Tl - Ts);
+                T_curr = Ts + fl_local * (Tl - Ts); 
             }
+
             fs_curr = std::clamp(fs_curr, 0.0, 1.0);
             T_curr = std::clamp(T_curr, 0.0, 1.0);
 
+            // 更新当前节点的真实比热容用于平衡态计算
             double fl_curr = 1.0 - fs_curr;
-            double Cp_loc = fs_curr * Cp_s + fl_curr * phi_v * Cp_l + fl_curr * (1.0 - phi_v) * Cp_g;
+            Cp_loc = fs_curr * Cp_s + fl_curr * phi_v * Cp_l + fl_curr * (1.0 - phi_v) * Cp_g;
 
             std::array<double, q> heq;
             compute_heq(H_curr, T_curr, Cp_ref, Cp_loc, ux_loc, uy_loc, heq);
@@ -639,8 +663,13 @@ void LBMSolver::update_flow_field() {
             for (int k = 0; k < q; ++k) {
                 int sx = (x - cx[k] + Nx) % Nx;
                 int sy = y - cy[k];
-                if (sy == 0 || sy == Ny-1) {
+                
+                // 【修改此处】仅底部执行半步反弹，顶部允许读取源数据
+                if (sy == 0) {
                     f[next][offset(x,y,k)] = f_post[offset(x,y,opp[k])];
+                } else if (sy == Ny - 1) {
+                    // 对于来自顶部的分布函数，直接读取当前态（稍后会被零梯度外推覆盖）
+                    f[next][offset(x,y,k)] = f[current][offset(sx,sy,k)];
                 } else {
                     f[next][offset(x,y,k)] = f_post[offset(sx,sy,k)];
                 }
@@ -649,16 +678,26 @@ void LBMSolver::update_flow_field() {
     }
 
     // 边界宏观量固定（无滑移）；分布函数用 Yuan-LB 平衡态形式（不能用经典 w·ρ）
+    // 在 update_flow_field() 内部，将顶部边界的逻辑替换为以下内容：
     for (int x = 0; x < Nx; ++x) {
-        int id_b = index(x,0);   ux[id_b]=0.0; uy[id_b]=0.0;
-        int id_t = index(x,Ny-1); ux[id_t]=0.0; uy[id_t]=0.0;
-        std::array<double, q> feq_b, feq_t;
-        compute_feq(rho_mix[id_b], p[id_b], 0.0, 0.0, feq_b);
-        compute_feq(rho_mix[id_t], p[id_t], 0.0, 0.0, feq_t);
-        for (int k = 0; k < q; ++k) {
-            f[next][offset(x,0,k)] = feq_b[k];
-            f[next][offset(x,Ny-1,k)] = feq_t[k];
-        }
+      // 底部边界（无滑移壁面）
+      int id_b = index(x,0);   
+      ux[id_b] = 0.0; uy[id_b] = 0.0;
+      std::array<double, q> feq_b;
+      compute_feq(rho_mix[id_b], p[id_b], 0.0, 0.0, feq_b);
+      for (int k = 0; k < q; ++k) {
+        f[next][offset(x,0,k)] = feq_b[k];
+      }
+    
+    // 顶部边界（开放出流 / 零梯度）
+      int id_t = index(x, Ny-1);
+      int id_t_in = index(x, Ny-2);
+      ux[id_t] = ux[id_t_in];
+      uy[id_t] = uy[id_t_in];
+      p[id_t] = p[id_t_in]; 
+      for (int k = 0; k < q; ++k) {
+          f[next][offset(x, Ny-1, k)] = f[next][offset(x, Ny-2, k)];
+      }
     }
 }
 
@@ -704,7 +743,6 @@ void LBMSolver::apply_wetting_bc() {
 void LBMSolver::apply_velocity_bc() {
     for (int x = 0; x < Nx; ++x) {
         ux[index(x,0)] = 0.0; uy[index(x,0)] = 0.0;
-        ux[index(x,Ny-1)] = 0.0; uy[index(x,Ny-1)] = 0.0;
     }
 }
 
@@ -713,16 +751,23 @@ void LBMSolver::apply_velocity_bc() {
 void LBMSolver::apply_temperature_bc() {
     for (int x = 0; x < Nx; ++x) {
         int id_b = index(x, 0);
+        int id_b_up = index(x, 1);
         
-        // 只有液滴底下是强迫冷源，外部空气是绝热的
         if (phi[id_b] > 0.5) {
             T[id_b] = 0.0;
+            fs[id_b] = 1.0;
+            H[id_b] = 0.0; // Cp_s * T (T=0)
         } else {
-            T[id_b] = T[index(x, 1)]; 
+            T[id_b] = T[id_b_up]; 
+            fs[id_b] = 0.0;
+            H[id_b] = Cp_g * T[id_b];
         }
         
-        // 顶部设为绝热 (Zero-gradient)
-        T[index(x, Ny-1)] = T[index(x, Ny-2)];
+        int id_t = index(x, Ny-1);
+        int id_t_in = index(x, Ny-2);
+        T[id_t] = T[id_t_in];
+        fs[id_t] = fs[id_t_in];
+        H[id_t] = H[id_t_in];
     }
 }
 
