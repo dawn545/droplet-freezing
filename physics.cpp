@@ -26,8 +26,9 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
       L(Cp_l * 0.5 / Ste_),  // 假设 Tm=0.5, Tw=0，则 ΔT=0.5
         // 相变温度（无量纲）：论文为 pure-material（水/冰）等温熔化
       Ts(0.5), Tl(0.5), Tm(0.5),
-        // 表面张力参数
-      sigma(0.005), W(2.0), M(0.01),
+        // 表面张力参数 + 浮力参数
+      sigma(0.01), W(2.0), M(0.01),
+      g_accel(0.0005), thermal_exp_coeff(0.0002),
       wettingAngle(90.0 * M_PI / 180.0),
         // 数组初始化
       current(0), next(1),
@@ -39,10 +40,13 @@ LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
       Fs_x(nx*ny, 0.0), Fs_y(nx*ny, 0.0),
       Gx(nx*ny, 0.0), Gy(nx*ny, 0.0),
       fx(nx*ny, 0.0), fy(nx*ny, 0.0),
-      m_dot(nx*ny, 0.0), q_dot(nx*ny, 0.0),S_field(nx*ny, 0.0),
+      m_dot(nx*ny, 0.0), q_dot(nx*ny, 0.0), S_field(nx*ny, 0.0),
       phi_ux_prev(nx*ny, 0.0), phi_uy_prev(nx*ny, 0.0),
       fs_prev(nx*ny, 0.0),
       lambda(nx*ny, 0.0), nx_field(nx*ny, 0.0), ny_field(nx*ny, 0.0),
+      grad_phi_x(nx*ny,0.0),
+      grad_phi_y(nx*ny,0.0),
+      lap_phi(nx*ny,0.0),
       ux_solid(nx*ny, 0.0), uy_solid(nx*ny, 0.0),
       Cp_ref(Cp_l)
 {
@@ -97,6 +101,34 @@ void LBMSolver::update_mixture_properties() {
     }
 }
 
+// ==================== 计算 Boussinesq 浮力项 （论文 Section 4.3） ====================
+void LBMSolver::compute_boussinesq_buoyancy() {
+    double T_ref = 0.5;  // 参考温度
+    double rho_ref = rho_l;  // 参考密度
+    
+    for (int y = 0; y < Ny; ++y) {
+        for (int x = 0; x < Nx; ++x) {
+            int id = index(x, y);
+            double phi_val = phi[id];
+            double T_val = T[id];
+            double fs_val = fs[id];
+            
+            // 只在液体区域应用浮力（φ > 0.5 且不是纯固体）
+            if (phi_val > 0.5 && fs_val < 0.9) {
+                // 【论文 Section 4.3】Boussinesq 浮力模型
+                // Fg = -ρ₀·g·β·(T - Tref)·ĵ
+                // 其中 ρ₀ = rho_l, β 是体积膨胀系数, g 是重力加速度
+                double buoyancy = -rho_ref * g_accel * thermal_exp_coeff * (T_val - T_ref);
+                Gx[id] = 0.0;
+                Gy[id] = buoyancy;  // 向上（y 方向正向）
+            } else {
+                Gx[id] = 0.0;
+                Gy[id] = 0.0;
+            }
+        }
+    }
+}
+
 // ==================== 计算流固耦合力（扩散界面法） ====================
 void LBMSolver::compute_fluid_solid_interaction() {
     // paper.md inline (Eq.20 下方): f = f_s · (u_s - u*) / Δt （加速度）
@@ -112,40 +144,48 @@ void LBMSolver::compute_fluid_solid_interaction() {
 }
 
 // ==================== 计算 λ 和界面法向量 ====================
-void LBMSolver::compute_lambda_and_normal() {
-    Array2D phi_map(Ny, Nx);
-    for (int y = 0; y < Ny; ++y)
-        for (int x = 0; x < Nx; ++x)
-            phi_map(y, x) = phi[index(x, y)];
+void LBMSolver::compute_lambda_and_normal()
+{
+    const double eps = 1e-12;
 
-    Array2D grad_x = Array2D::Zero(Ny, Nx);
-    Array2D grad_y = Array2D::Zero(Ny, Nx);
-    // 中心差分计算梯度
-    for (int y = 1; y < Ny-1; ++y) {
-        for (int x = 1; x < Nx-1; ++x) {
-            grad_x(y, x) = (phi_map(y, x+1) - phi_map(y, x-1)) / (2.0 * dx);
-            grad_y(y, x) = (phi_map(y+1, x) - phi_map(y-1, x)) / (2.0 * dx);
-        }
-    }
-    // 边界处采用单边差分
-    for (int x = 0; x < Nx; ++x) {
-        grad_x(0, x) = grad_x(1, x);
-        grad_y(0, x) = grad_y(1, x);
-        grad_x(Ny-1, x) = grad_x(Ny-2, x);
-        grad_y(Ny-1, x) = grad_y(Ny-2, x);
-    }
+    for (int y=0;y<Ny;++y)
+    {
+        for (int x=0;x<Nx;++x)
+        {
+            int id=index(x,y);
+            double gx=0.0;
+            double gy=0.0;
+            double lap=0.0;
+            double phi0=phi[id];
+            for (int k=1;k<q;++k)
+            {
+                int xn=(x+cx[k]+Nx)%Nx;
+                int yn=y+cy[k];
 
-    for (int y = 0; y < Ny; ++y) {
-        for (int x = 0; x < Nx; ++x) {
-            int id = index(x, y);
-            double gx = grad_x(y, x);
-            double gy = grad_y(y, x);
-            double norm = std::sqrt(gx*gx + gy*gy) + 1e-12;
-            nx_field[id] = gx / norm;
-            ny_field[id] = gy / norm;
-            // λ = 4φ(1-φ)/W (式3)
-            double phi_val = phi[id];
-            lambda[id] = 4.0 * phi_val * (1.0 - phi_val) / W;
+                yn=std::max(0,std::min(Ny-1,yn));
+
+                int nid=index(xn,yn);
+
+                double phin=phi[nid];
+
+                //---------------- Eq.(38a)
+                gx+=w[k]*cx[k]*phin;
+                gy+=w[k]*cy[k]*phin;
+
+                //---------------- Eq.(38b)
+                lap+=2.0*w[k]*(phin-phi0);
+            }
+            gx/=cs2*dt;
+            gy/=cs2*dt;
+            lap/=(cs2*dt*dt);
+            grad_phi_x[id]=gx;
+            grad_phi_y[id]=gy;
+            lap_phi[id]=lap;
+            double norm=sqrt(gx*gx+gy*gy)+eps;
+            nx_field[id]=gx/norm;
+            ny_field[id]=gy/norm;
+
+            lambda[id]=4.0*phi0*(1.0-phi0)/W;
         }
     }
 }
@@ -243,7 +283,7 @@ void LBMSolver::compute_macros() {
 
     // 计算压力 (式36)
     // 先计算梯度
-// 计算压力 (式36) 和 完整的源项 S
+    // 计算压力 (式36) 和 完整的源项 S
     Array2D grad_p_x = Array2D::Zero(Ny, Nx);
     Array2D grad_p_y = Array2D::Zero(Ny, Nx);
     Array2D grad_rho_x = Array2D::Zero(Ny, Nx);
@@ -368,6 +408,9 @@ void LBMSolver::compute_heq(double H, double T, double Cp_ref, double Cp_loc, do
 
 // ==================== 相场更新（Allen-Cahn 方程） ====================
 void LBMSolver::update_phase_field() {
+    // 计算浮力（每次相场更新前）
+    compute_boussinesq_buoyancy();
+    
     std::vector<double> g_post(Nx*Ny*q, 0.0);
     compute_lambda_and_normal();
 
@@ -434,8 +477,7 @@ void LBMSolver::update_phase_field() {
             double div_u = 0.0;
             if (y > 0 && y < Ny-1) {
                 int xp = (x+1)%Nx, xm = (x-1+Nx)%Nx;
-                div_u = (ux[index(xp,y)] - ux[index(xm,y)])/(2.0*dx) +
-                        (uy[index(x,y+1)] - uy[index(x,y-1)])/(2.0*dx);
+                div_u = m_dot[id];
             }
             double phi_new = sum_g / (1.0 - 0.5 * dt * div_u);
             phi[id] = std::clamp(phi_new, 0.0, 1.0);
@@ -457,7 +499,10 @@ void LBMSolver::update_phase_field() {
 void LBMSolver::update_temperature() {
     std::vector<double> h_post(Nx*Ny*q, 0.0);
 
-    // 内部节点碰撞 (保持原样)
+    // 计算浮力
+    compute_boussinesq_buoyancy();
+    
+    // 内部节点碰撞
     for (int y = 1; y < Ny-1; ++y) {
         for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
@@ -536,7 +581,7 @@ void LBMSolver::update_temperature() {
         }
     }
 
-    // 更新宏观量
+    // 更新宏观量 - 同时计算潜热源项
     for (int y = 1; y < Ny-1; ++y) {
         for (int x = 0; x < Nx; ++x) {
             int id = index(x, y);
@@ -559,6 +604,13 @@ void LBMSolver::update_temperature() {
                 fs_new = 1.0 - fl_local;
                 T_new = Ts + fl_local * (Tl - Ts);
             }
+            
+            // 【论文式(6)】计算潜热源项：q̇ = -∂(ρLf_l)/∂t = ρL·∂fs/∂t
+            // 使用当前时刻的固相分数变化率
+            double fs_old = fs[id];
+            double rho_ref = rho_mix[id];
+            q_dot[id] = rho_ref * L * (fs_new - fs_old) / dt;
+            
             H[id] = H_new;
             fs[id] = std::clamp(fs_new, 0.0, 1.0);
             T[id] = std::clamp(T_new, 0.0, 1.0);
@@ -797,20 +849,16 @@ void LBMSolver::initialize_fields() {
             phi[id] = 0.5 + 0.5 * std::tanh(2.0 * (R - r) / W);
             phi[id] = std::clamp(phi[id], 0.0, 1.0);
 
-            // ================= COMSOL 效果核心初始化 =================
+            // ================= 修正初始化：完全液态液滴，无预冻结 =================
+            // 根据论文 Figure 4-6，液滴应初始为完全液态（fs=0）
             if (phi[id] > 0.5) {
-                // 1. 液滴内部：最底部铺一层极薄的平齐冰层
-                if (y == 0) {
-                    fs[id] = 1.0;
-                    T[id] = 0.0;   // 贴近冷板，温度为冷源温度
-                } else {
-                    fs[id] = 0.0;
-                    T[id] = 0.6;   // 液体初始温度 (Tm=0.5，略高于熔点防止瞬间全冻)
-                }
+                // 1. 液滴内部：完全液态初始化
+                fs[id] = 0.0;       // 【修正】液体不是固体
+                T[id] = 0.55;       // 初始温度略高于熔点
             } else {
-                // 2. 气相环境：没有冰，初始温度与水相同
+                // 2. 气相环境：没有冰，初始温度与液滴相同
                 fs[id] = 0.0;
-                T[id] = 0.6;
+                T[id] = 0.55;       // 气相同温度便于热传导
             }
             // =========================================================
 
@@ -857,6 +905,9 @@ void LBMSolver::initialize_fields() {
 
 // ==================== 主循环：依次更新各场 ====================
 void LBMSolver::collide_and_stream() {
+    // 【修正】每次迭代都计算浮力以促进顶部尖端形成
+    compute_boussinesq_buoyancy();
+    
     update_flow_field();
     update_phase_field();
     update_temperature();
