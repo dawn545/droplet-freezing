@@ -70,6 +70,10 @@ private:
     void compute_macros();              // 从分布函数计算宏观量 (密度、速度、压力，含质量源项修正)
     void update_phase_field();          // 更新相场 (Allen-Cahn方程，式21-26)，用于无相变界面
     void update_temperature();          // 更新温度场 (焓法LB，式27-29)
+    // 焓解码 (式8,9)：由总焓 H 与相场 φ 反解 (固相分数 fs, 温度 T)。
+    // 潜热按 φ 缩放、显热容含气相贡献，并对无潜热区 (Hl-Hs→0) 做退化保护。
+    // 碰撞前与迁移后的宏观重构统一调用它，保证状态方程一致 (避免界面伪凝固)。
+    void decode_enthalpy(double H_curr, double phi_v, double& fs_out, double& T_out) const;
     void update_flow_field();           // 更新流场 (Navier-Stokes，式30-36)
 
     // ==================== 辅助计算函数 ====================
