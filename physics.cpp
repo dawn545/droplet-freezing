@@ -496,6 +496,34 @@ void LBMSolver::update_phase_field() {
 
 
 // ==================== 温度场更新（焓法 LB） ====================
+// ==================== 焓解码：H,φ → (fs,T) （式8,9，φ 缩放潜热 + 气相显热） ====================
+void LBMSolver::decode_enthalpy(double H_curr, double phi_v, double& fs_out, double& T_out) const {
+    // 显热容含气相贡献；固相线/液相线用相场混合比热，潜热按 φ 缩放（纯气相 φ→0 时无潜热）
+    double Cp_sensible_s = phi_v * Cp_s + (1.0 - phi_v) * Cp_g;
+    double Cp_sensible_l = phi_v * Cp_l + (1.0 - phi_v) * Cp_g;
+    const double Hs_val = Cp_sensible_s * Ts;
+    const double Hl_val = Cp_sensible_l * Tl + phi_v * L;
+
+    if (Hl_val - Hs_val < 1e-6) {
+        // 退化保护：无潜热区（纯气相或 Ts≈Tl 且无液固），按显热直接反解，跳过相变判定
+        fs_out = 0.0;
+        T_out = H_curr / std::max(Cp_sensible_l, 1e-6);
+    } else if (H_curr <= Hs_val) {
+        fs_out = 1.0;
+        T_out = H_curr / std::max(Cp_sensible_s, 1e-6);
+    } else if (H_curr >= Hl_val) {
+        fs_out = 0.0;
+        T_out = (H_curr - phi_v * L) / std::max(Cp_sensible_l, 1e-6);
+    } else {
+        double fl_local = (H_curr - Hs_val) / (Hl_val - Hs_val);
+        fs_out = 1.0 - fl_local;
+        T_out = Ts + fl_local * (Tl - Ts);
+    }
+
+    fs_out = std::clamp(fs_out, 0.0, 1.0);
+    T_out = std::clamp(T_out, 0.0, 1.0);
+}
+
 void LBMSolver::update_temperature() {
     std::vector<double> h_post(Nx*Ny*q, 0.0);
 
@@ -511,34 +539,10 @@ void LBMSolver::update_temperature() {
             double H_curr = H[id];
 
             double phi_v = phi[id];
-            
-            // 【修正】固相线对应的等效显热容也必须包含气相的贡献！
-            double Cp_sensible_s = phi_v * Cp_s + (1.0 - phi_v) * Cp_g;
-            double Cp_sensible_l = phi_v * Cp_l + (1.0 - phi_v) * Cp_g;
-            
-            const double Hs_val = Cp_sensible_s * Ts;
-            const double Hl_val = Cp_sensible_l * Tl + phi_v * L;
 
+            // 焓解码 (式8,9)：与迁移后宏观重构共用同一逻辑，避免状态方程不一致
             double fs_curr, T_curr, Cp_loc;
-
-            // 【新增保护】如果处于纯气相或无潜热区域，直接按照显热计算，跳过相变判定
-            if (Hl_val - Hs_val < 1e-6) {
-                fs_curr = 0.0;
-                T_curr = H_curr / std::max(Cp_sensible_l, 1e-6);
-            } else if (H_curr <= Hs_val) {
-                fs_curr = 1.0;
-                T_curr = H_curr / std::max(Cp_sensible_s, 1e-6);
-            } else if (H_curr >= Hl_val) {
-                fs_curr = 0.0;
-                T_curr = (H_curr - phi_v * L) / std::max(Cp_sensible_l, 1e-6);
-            } else {
-                double fl_local = (H_curr - Hs_val) / (Hl_val - Hs_val);
-                fs_curr = 1.0 - fl_local;
-                T_curr = Ts + fl_local * (Tl - Ts); 
-            }
-
-            fs_curr = std::clamp(fs_curr, 0.0, 1.0);
-            T_curr = std::clamp(T_curr, 0.0, 1.0);
+            decode_enthalpy(H_curr, phi_v, fs_curr, T_curr);
 
             // 更新当前节点的真实比热容用于平衡态计算
             double fl_curr = 1.0 - fs_curr;
@@ -587,24 +591,11 @@ void LBMSolver::update_temperature() {
             int id = index(x, y);
             double H_new = 0.0;
             for (int k = 0; k < q; ++k) H_new += h[next][offset(x,y,k)];
-            const double Hs_val = Cp_s * Ts;
-            const double Hl_val = Cp_l * Tl + L;
             double phi_v = phi[id];
+            // 焓解码 (式8,9)：与碰撞前解码共用同一 φ 缩放阈值，消除界面伪凝固
             double fs_new, T_new;
-            if (phi_v < 0.5) {
-                fs_new = 0.0;
-                double Cp_loc_eff = phi_v * Cp_l + (1.0 - phi_v) * Cp_g;
-                T_new = H_new / std::max(Cp_loc_eff, 1e-6);
-            } else if (H_new <= Hs_val) {
-                fs_new = 1.0; T_new = H_new / Cp_s;
-            } else if (H_new >= Hl_val) {
-                fs_new = 0.0; T_new = (H_new - L) / Cp_l;
-            } else {
-                double fl_local = (H_new - Hs_val) / (Hl_val - Hs_val);
-                fs_new = 1.0 - fl_local;
-                T_new = Ts + fl_local * (Tl - Ts);
-            }
-            
+            decode_enthalpy(H_new, phi_v, fs_new, T_new);
+
             // 【论文式(6)】计算潜热源项：q̇ = -∂(ρLf_l)/∂t = ρL·∂fs/∂t
             // 使用当前时刻的固相分数变化率
             double fs_old = fs[id];
