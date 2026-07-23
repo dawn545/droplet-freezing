@@ -903,8 +903,12 @@ void LBMSolver::collide_and_stream() {
     update_phase_field();
     update_temperature();
     std::swap(current, next);
-    compute_macros();
+    // 【顺序修正】迁移后先补全边界，再重构宏观量。
+    // apply_boundary_conditions 先把边界 φ,T,fs,H 修正到最新物理状态，
+    // 随后 compute_macros 计算的 Fs(φ)、质量源 ṁ(∂fs/∂t)、流固耦合力 f_s(u_s-u*)
+    // 才使用边界修正后的场，避免用残缺/滞后的边界值污染源项。
     apply_boundary_conditions();
+    compute_macros();
 }
 
 void LBMSolver::step(int steps) {
