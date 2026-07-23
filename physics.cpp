@@ -474,10 +474,14 @@ void LBMSolver::update_phase_field() {
             int id = index(x, y);
             double sum_g = 0.0;
             for (int k = 0; k < q; ++k) sum_g += g[next][offset(x,y,k)];
+            // 【问题2修正】∇·u 与碰撞项(式25)保持同一定义：中心差分散度。
+            // 原先此处用 m_dot[id]，与碰撞项的中心差分散度不自洽（且 m_dot 成员含 ρ 因子）。
             double div_u = 0.0;
             if (y > 0 && y < Ny-1) {
                 int xp = (x+1)%Nx, xm = (x-1+Nx)%Nx;
-                div_u = m_dot[id];
+                double dux_dx = (ux[index(xp,y)] - ux[index(xm,y)])/(2.0*dx);
+                double duy_dy = (uy[index(x,y+1)] - uy[index(x,y-1)])/(2.0*dx);
+                div_u = dux_dx + duy_dy;
             }
             double phi_new = sum_g / (1.0 - 0.5 * dt * div_u);
             phi[id] = std::clamp(phi_new, 0.0, 1.0);
