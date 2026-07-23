@@ -1,223 +1,4 @@
-#include "physics.hpp"
-#include <algorithm>
-#include <cmath>
-#include <iostream>
-
-// ==================== D2Q9 常数（格子Boltzmann标准参数） ====================
-static const int cx[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
-static const int cy[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
-static const double w[9] = {
-    4.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0,
-    1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
-};
-static const int opp[9] = {0, 3, 4, 1, 2, 7, 8, 5, 6};
-
-// ==================== 构造函数：初始化所有物理参数和场 ====================
-LBMSolver::LBMSolver(int nx, int ny, double gamma_, double Ste_, double Pr_)
-    : Nx(nx), Ny(ny), gamma(gamma_), Ste(Ste_), Pr(Pr_),
-      dx(1.0), dt(0.1),
-      // 密度（无量纲，以液体密度为参考）；rho_g 取 0.1 让 incompressible-pressure LB 数值稳定
-      rho_g(0.1), rho_l(1.0), rho_s(gamma_),
-        // 比热（无量纲，以液体比热为参考）
-      Cp_g(1.0), Cp_l(1.0), Cp_s(0.5),
-        // 导热系数（无量纲，以液体导热系数为参考）
-      k_g(0.1), k_l(1.0), k_s(3.8),
-        // 潜热（无量纲，由Stefan数定义：Ste = Cp_l*(Tm-Tw)/L）
-      L(Cp_l * 0.5 / Ste_),  // 假设 Tm=0.5, Tw=0，则 ΔT=0.5
-        // 相变温度（无量纲）：论文为 pure-material（水/冰）等温熔化
-      Ts(0.5), Tl(0.5), Tm(0.5),
-        // 表面张力参数 + 浮力参数
-      sigma(0.01), W(2.0), M(0.01),
-      g_accel(0.0005), thermal_exp_coeff(0.0002),
-      wettingAngle(90.0 * M_PI / 180.0),
-        // 数组初始化
-      current(0), next(1),
-      phi(nx*ny, 0.0), fs(nx*ny, 0.0), fl(nx*ny, 0.0),
-      T(nx*ny, 0.0), H(nx*ny, 0.0), p(nx*ny, 0.0),
-      rho_mix(nx*ny, 0.0), mu_mix(nx*ny, 0.0), k_mix(nx*ny, 0.0), Cp_mix(nx*ny, 0.0),
-      ux(nx*ny, 0.0), uy(nx*ny, 0.0),
-      ux_star(nx*ny, 0.0), uy_star(nx*ny, 0.0),
-      Fs_x(nx*ny, 0.0), Fs_y(nx*ny, 0.0),
-      Gx(nx*ny, 0.0), Gy(nx*ny, 0.0),
-      fx(nx*ny, 0.0), fy(nx*ny, 0.0),
-      m_dot(nx*ny, 0.0), q_dot(nx*ny, 0.0), S_field(nx*ny, 0.0),
-      phi_ux_prev(nx*ny, 0.0), phi_uy_prev(nx*ny, 0.0),
-      fs_prev(nx*ny, 0.0),
-      lambda(nx*ny, 0.0), nx_field(nx*ny, 0.0), ny_field(nx*ny, 0.0),
-      grad_phi_x(nx*ny,0.0),
-      grad_phi_y(nx*ny,0.0),
-      lap_phi(nx*ny,0.0),
-      ux_solid(nx*ny, 0.0), uy_solid(nx*ny, 0.0),
-      Cp_ref(Cp_l)
-{
-    int total = nx * ny * q;
-    f[0].assign(total, 0.0); f[1].assign(total, 0.0);
-    g[0].assign(total, 0.0); g[1].assign(total, 0.0);
-    h[0].assign(total, 0.0); h[1].assign(total, 0.0);
-
-    double c = dx / dt;
-    cs2 = c * c / 3.0;
-
-    // 相场弛豫时间（由迁移率 M 决定：M = cs2*(tau_g-0.5)*dt，论文 Eq.21 之后）
-    tau_g = M / (cs2 * dt) + 0.5;
-
-    // 流场和温度场弛豫时间在 update_flow_field / update_temperature 内由 mu_mix、k_mix 逐点计算
-
-    // 表面张力参数（式13）
-    beta = 12.0 * sigma / W;
-    kappa = 1.5 * sigma * W;
-
-    // 参考比热（用于温度场平衡分布中的 Cp_ref）
-    Cp_ref = Cp_l;
-
-    // 初始化固体速度为零（无滑移）
-    std::fill(ux_solid.begin(), ux_solid.end(), 0.0);
-    std::fill(uy_solid.begin(), uy_solid.end(), 0.0);
-}
-
-// ==================== 更新依赖于相态的混合物理属性 ====================
-void LBMSolver::update_mixture_properties() {
-    for (int y = 0; y < Ny; ++y) {
-        for (int x = 0; x < Nx; ++x) {
-            int id = index(x, y);
-            double phi_val = phi[id];
-            double fs_val = fs[id];
-            double fl_val = 1.0 - fs_val;
-
-            // 密度：式(1)   ζ = fs*ζ_s + (1-fs)*ϕ*ζ_l + (1-fs)*(1-ϕ)*ζ_g
-            rho_mix[id] = fs_val * rho_s + fl_val * phi_val * rho_l + fl_val * (1.0 - phi_val) * rho_g;
-            // 比热
-            Cp_mix[id] = fs_val * Cp_s + fl_val * phi_val * Cp_l + fl_val * (1.0 - phi_val) * Cp_g;
-            // 导热系数
-            k_mix[id] = fs_val * k_s + fl_val * phi_val * k_l + fl_val * (1.0 - phi_val) * k_g;
-            // 动力粘度：液相由 Pr 决定；论文未给固相/气相 μ
-            //  - 固相：取 μ_s = μ_l，因为速度由 immersed-boundary 控制 (论文 Eq.20 后说明)
-            //  - 气相：与液相同 Pr 下 μ_g = Pr·k_g/Cp_g = 0.1·μ_l
-            double mu_l = Pr * k_l / Cp_l;
-            double mu_g = Pr * k_g / Cp_g;
-            double mu_s = mu_l;
-            mu_mix[id] = fs_val * mu_s + fl_val * phi_val * mu_l + fl_val * (1.0 - phi_val) * mu_g;
-        }
-    }
-}
-
-// ==================== 计算 Boussinesq 浮力项 （论文 Section 4.3） ====================
-void LBMSolver::compute_boussinesq_buoyancy() {
-    double T_ref = 0.5;  // 参考温度
-    double rho_ref = rho_l;  // 参考密度
-    
-    for (int y = 0; y < Ny; ++y) {
-        for (int x = 0; x < Nx; ++x) {
-            int id = index(x, y);
-            double phi_val = phi[id];
-            double T_val = T[id];
-            double fs_val = fs[id];
-            
-            // 只在液体区域应用浮力（φ > 0.5 且不是纯固体）
-            if (phi_val > 0.5 && fs_val < 0.9) {
-                // 【论文 Section 4.3】Boussinesq 浮力模型
-                // Fg = -ρ₀·g·β·(T - Tref)·ĵ
-                // 其中 ρ₀ = rho_l, β 是体积膨胀系数, g 是重力加速度
-                double buoyancy = -rho_ref * g_accel * thermal_exp_coeff * (T_val - T_ref);
-                Gx[id] = 0.0;
-                Gy[id] = buoyancy;  // 向上（y 方向正向）
-            } else {
-                Gx[id] = 0.0;
-                Gy[id] = 0.0;
-            }
-        }
-    }
-}
-
-// ==================== 计算流固耦合力（扩散界面法） ====================
-void LBMSolver::compute_fluid_solid_interaction() {
-    // paper.md inline (Eq.20 下方): f = f_s · (u_s - u*) / Δt （加速度）
-    // 代码中的 fx[i] 表示 ρf（force per volume），用于 Eq.(33) 的 ci·(F+ρf)/cs² 项
-    // 故 fx[i] = ρ · f_s · (u_s - u*) / Δt
-    for (int i = 0; i < Nx*Ny; ++i) {
-        double fs_loc = fs[i];
-        double rho_loc = rho_mix[i];
-        double factor = 2 * rho_loc * fs_loc / dt;
-        fx[i] = factor * (ux_solid[i] - ux_star[i]);
-        fy[i] = factor * (uy_solid[i] - uy_star[i]);
-    }
-}
-
-// ==================== 计算 λ 和界面法向量 ====================
-void LBMSolver::compute_lambda_and_normal()
-{
-    const double eps = 1e-12;
-
-    for (int y=0;y<Ny;++y)
-    {
-        for (int x=0;x<Nx;++x)
-        {
-            int id=index(x,y);
-            double gx=0.0;
-            double gy=0.0;
-            double lap=0.0;
-            double phi0=phi[id];
-            for (int k=1;k<q;++k)
-            {
-                int xn=(x+cx[k]+Nx)%Nx;
-                int yn=y+cy[k];
-
-                yn=std::max(0,std::min(Ny-1,yn));
-
-                int nid=index(xn,yn);
-
-                double phin=phi[nid];
-
-                //---------------- Eq.(38a)
-                gx+=w[k]*cx[k]*phin;
-                gy+=w[k]*cy[k]*phin;
-
-                //---------------- Eq.(38b)
-                lap+=2.0*w[k]*(phin-phi0);
-            }
-            gx/=cs2*dt;
-            gy/=cs2*dt;
-            lap/=(cs2*dt*dt);
-            grad_phi_x[id]=gx;
-            grad_phi_y[id]=gy;
-            lap_phi[id]=lap;
-            double norm=sqrt(gx*gx+gy*gy)+eps;
-            nx_field[id]=gx/norm;
-            ny_field[id]=gy/norm;
-
-            lambda[id]=4.0*phi0*(1.0-phi0)/W;
-        }
-    }
-}
-
-// ==================== 计算化学势 μ_φ 和表面张力 F_s ====================
-void LBMSolver::compute_phase_derivatives() {
-    Eigen::Map<Array2D> phi_map(phi.data(), Ny, Nx);
-    Eigen::Map<Array2D> Fsx_map(Fs_x.data(), Ny, Nx);
-    Eigen::Map<Array2D> Fsy_map(Fs_y.data(), Ny, Nx);
-
-    Array2D lap_phi = Array2D::Zero(Ny, Nx);
-    Array2D grad_x = Array2D::Zero(Ny, Nx);
-    Array2D grad_y = Array2D::Zero(Ny, Nx);
-
-    // 中心差分计算梯度和拉普拉斯
-    for (int y = 1; y < Ny-1; ++y) {
-        for (int x = 1; x < Nx-1; ++x) {
-            double phi_c = phi_map(y, x);
-            double phi_l = phi_map(y, x-1);
-            double phi_r = phi_map(y, x+1);
-            double phi_d = phi_map(y-1, x);
-            double phi_u = phi_map(y+1, x);
-            grad_x(y, x) = (phi_r - phi_l) / (2.0 * dx);
-            grad_y(y, x) = (phi_u - phi_d) / (2.0 * dx);
-            lap_phi(y, x) = (phi_l + phi_r + phi_d + phi_u - 4.0*phi_c) / (dx*dx);
-        }
-    }
-    
-    // 在函数开头引入液相分数的 Eigen Map
-    Eigen::Map<Array2D> fl_map(fl.data(), Ny, Nx);
-    
-    // ... 前面的梯度与 mu 计算保持不变 ...
+c.. 前面的梯度与 mu 计算保持不变 ...
     Array2D mu = 4.0 * beta * phi_map * (phi_map - 1.0) * (phi_map - 0.5) - kappa * lap_phi;
 
     // 【修正】使用液相分数截断表面张力，防止冰层表面产生伪速度
@@ -277,9 +58,15 @@ void LBMSolver::compute_macros() {
     // 计算流固耦合力
     compute_fluid_solid_interaction();
 
-    // 修正速度 (式35)：u = u* + 0.5·dt·f/ρ（f 为 force/volume）
-    ux_map = ux_star_map + 0.5 * dt * Eigen::Map<Array2D>(fx.data(), Ny, Nx) / rho_map;
-    uy_map = uy_star_map + 0.5 * dt * Eigen::Map<Array2D>(fy.data(), Ny, Nx) / rho_map;
+    // 修正速度：immersed-boundary 精确混合 u = (1-f_s)u* + f_s·u_s
+    // 【问题3修正】fx 现为 factor-1 的 ρf，若仍用 u=u*+0.5·dt·fx/ρ 只得半程混合，
+    // 固相约束不严格（fs=1 时只到 (u*+u_s)/2）。故速度修正与式(33)动量源解耦：
+    // 这里直接按固相分数在 u* 与固相速度间线性插值，fs=1 时精确得到 u=u_s（=0）。
+    Eigen::Map<Array2D> fs_blend(fs.data(), Ny, Nx);
+    Eigen::Map<Array2D> uxs_map(ux_solid.data(), Ny, Nx);
+    Eigen::Map<Array2D> uys_map(uy_solid.data(), Ny, Nx);
+    ux_map = (1.0 - fs_blend) * ux_star_map + fs_blend * uxs_map;
+    uy_map = (1.0 - fs_blend) * uy_star_map + fs_blend * uys_map;
 
     // 计算压力 (式36)
     // 先计算梯度
@@ -919,4 +706,3 @@ void LBMSolver::step(int steps) {
     for (int i = 0; i < steps; ++i) {
         collide_and_stream();
     }
-}
