@@ -903,9 +903,10 @@ void LBMSolver::collide_and_stream() {
     // 【修正】每次迭代都计算浮力以促进顶部尖端形成
     compute_boussinesq_buoyancy();
     
-    update_flow_field();
+    // 【顺序修正】先计算相场，再依次计算温度场和流场
     update_phase_field();
     update_temperature();
+    update_flow_field();
     std::swap(current, next);
     // 【顺序修正】迁移后先补全边界，再重构宏观量。
     // apply_boundary_conditions 先把边界 φ,T,fs,H 修正到最新物理状态，
